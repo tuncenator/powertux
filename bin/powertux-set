@@ -1,0 +1,38 @@
+#!/bin/sh
+# Apply a powertux power level (1-4).
+# Install: /usr/local/sbin/powertux-set, mode 0755, owner root.
+# Writes platform_profile; switches tccd to the corresponding profile.
+set -eu
+[ $# -eq 1 ] || { echo "usage: $0 <1|2|3|4>" >&2; exit 2; }
+[ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+case "$1" in
+    1) pp=low-power;   prof=powertux-silent   ;;
+    2) pp=performance; prof=powertux-quiet    ;;
+    3) pp=performance; prof=powertux-balanced ;;
+    4) pp=performance; prof=powertux-perf     ;;
+    *) echo "level must be 1-4" >&2; exit 2 ;;
+esac
+printf '%s' "$pp" > /sys/firmware/acpi/platform_profile
+# tccd can be mid-restart (e.g., right after install or a tccd self-restart).
+# busctl returns silently then but the temp profile is never applied. Retry
+# up to 3 times with 1s backoff; verify after the call that the active id
+# matches what we asked for.
+attempts=0
+while [ $attempts -lt 3 ]; do
+    attempts=$((attempts + 1))
+    if busctl call com.tuxedocomputers.tccd /com/tuxedocomputers/tccd \
+        com.tuxedocomputers.tccd SetTempProfileById s "$prof" >/dev/null 2>&1
+    then
+        # busctl emits the inner JSON with each `"` escaped as `\"`, so the
+        # id field appears as `\"id\":\"<value>\"`. Match the escaped form.
+        active=$(busctl call com.tuxedocomputers.tccd /com/tuxedocomputers/tccd \
+            com.tuxedocomputers.tccd GetActiveProfileJSON 2>/dev/null \
+            | sed -n 's/.*\\"id\\":\\"\([^\\]*\)\\".*/\1/p')
+        if [ "$active" = "$prof" ]; then
+            exit 0
+        fi
+    fi
+    sleep 1
+done
+echo "powertux-set: failed to apply tccd profile $prof after $attempts attempts" >&2
+exit 1

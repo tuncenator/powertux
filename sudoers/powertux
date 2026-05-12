@@ -1,0 +1,6 @@
+# Passwordless powertux-set for waybar click actions.
+# Install: /etc/sudoers.d/powertux, mode 0440, owner root. Validate with visudo -c.
+# Note: __POWERTUX_USER__ is substituted with the invoking user at install time
+# by install.sh. If you edit this file directly, replace the placeholder with
+# your username before copying to /etc/sudoers.d/powertux.
+__POWERTUX_USER__ ALL=(root) NOPASSWD: /usr/local/sbin/powertux-set 1, /usr/local/sbin/powertux-set 2, /usr/local/sbin/powertux-set 3, /usr/local/sbin/powertux-set 4

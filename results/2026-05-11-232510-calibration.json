@@ -1,0 +1,170 @@
+{
+  "timestamp": "2026-05-11-232510",
+  "ac_online": "1",
+  "host": "ARCHON",
+  "kernel": "6.18.26-1-MANJARO",
+  "results": [
+    {
+      "candidate": {
+        "name": "S-lp-BP-b0",
+        "pp": "low-power",
+        "epp": "balance_performance",
+        "boost": 0
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 4.92,
+        "freq_mhz_mean": 1344.0,
+        "freq_mhz_max": 1950.0,
+        "temp_c_mean": 44.0,
+        "temp_c_max": 44.8,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.1,
+        "package_w": 19.19,
+        "freq_mhz_mean": 1934.0,
+        "freq_mhz_max": 2012.0,
+        "temp_c_mean": 49.5,
+        "temp_c_max": 53.8,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 75755
+    },
+    {
+      "candidate": {
+        "name": "S-lp-pw-b0",
+        "pp": "low-power",
+        "epp": "power",
+        "boost": 0
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 5.55,
+        "freq_mhz_mean": 1250.0,
+        "freq_mhz_max": 1610.0,
+        "temp_c_mean": 45.9,
+        "temp_c_max": 46.6,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.09,
+        "package_w": 18.82,
+        "freq_mhz_mean": 1912.0,
+        "freq_mhz_max": 2012.0,
+        "temp_c_mean": 50.5,
+        "temp_c_max": 54.1,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 74979
+    },
+    {
+      "candidate": {
+        "name": "S-bal-BP-b0",
+        "pp": "balanced",
+        "epp": "balance_performance",
+        "boost": 0
+      },
+      "idle": {
+        "duration_s": 20.04,
+        "package_w": 5.74,
+        "freq_mhz_mean": 1296.0,
+        "freq_mhz_max": 1834.0,
+        "temp_c_mean": 46.5,
+        "temp_c_max": 47.5,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.1,
+        "package_w": 19.42,
+        "freq_mhz_mean": 1944.0,
+        "freq_mhz_max": 2012.0,
+        "temp_c_mean": 51.0,
+        "temp_c_max": 54.2,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 75463
+    },
+    {
+      "candidate": {
+        "name": "Q-lp-pw",
+        "pp": "low-power",
+        "epp": "power",
+        "boost": 1
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 4.92,
+        "freq_mhz_mean": 1229.0,
+        "freq_mhz_max": 1548.0,
+        "temp_c_mean": 47.2,
+        "temp_c_max": 53.9,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.08,
+        "package_w": 44.07,
+        "freq_mhz_mean": 2945.0,
+        "freq_mhz_max": 3757.0,
+        "temp_c_mean": 66.8,
+        "temp_c_max": 83.0,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 109182
+    },
+    {
+      "candidate": {
+        "name": "B-perf-BP",
+        "pp": "performance",
+        "epp": "balance_performance",
+        "boost": 1
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 5.76,
+        "freq_mhz_mean": 1865.0,
+        "freq_mhz_max": 2755.0,
+        "temp_c_mean": 46.5,
+        "temp_c_max": 47.9,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.07,
+        "package_w": 47.26,
+        "freq_mhz_mean": 3157.0,
+        "freq_mhz_max": 3801.0,
+        "temp_c_mean": 69.0,
+        "temp_c_max": 81.1,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 109444
+    },
+    {
+      "candidate": {
+        "name": "P-perf-pf",
+        "pp": "performance",
+        "epp": "performance",
+        "boost": 1
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 9.66,
+        "freq_mhz_mean": 1639.0,
+        "freq_mhz_max": 2959.0,
+        "temp_c_mean": 49.0,
+        "temp_c_max": 51.1,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.07,
+        "package_w": 64.23,
+        "freq_mhz_mean": 3527.0,
+        "freq_mhz_max": 3903.0,
+        "temp_c_mean": 81.1,
+        "temp_c_max": 89.6,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 118417
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Install 4 powertux TCC profiles into /etc/tcc/profiles.
+
+Preserves existing profiles and state-map. Idempotent.
+Usage:
+  sudo powertux-install-profiles          # add or update powertux-* entries
+  sudo powertux-install-profiles --remove # delete powertux-* entries
+"""
+import copy
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PROFILES_FILE = "/etc/tcc/profiles"
+BACKUP = "/etc/tcc/profiles.bak-pre-powertux"
+
+SPECS = [
+    {
+        "id": "powertux-silent",
+        "name": "powertux-silent",
+        "description": "powertux L1: boost off, silent",
+        "epp": "power",
+        "noTurbo": True,
+        "odm": "",
+    },
+    {
+        "id": "powertux-quiet",
+        "name": "powertux-quiet",
+        "description": "powertux L2: ODM power_save, ~25W",
+        "epp": "balance_performance",
+        "noTurbo": False,
+        "odm": "power_save",
+    },
+    {
+        "id": "powertux-balanced",
+        "name": "powertux-balanced",
+        "description": "powertux L3: ODM enthusiast, ~41W",
+        "epp": "balance_performance",
+        "noTurbo": False,
+        "odm": "enthusiast",
+    },
+    {
+        "id": "powertux-perf",
+        "name": "powertux-perf",
+        "description": "powertux L4: ODM overboost + EPP perf, ~64W",
+        "epp": "performance",
+        "noTurbo": False,
+        "odm": "overboost",
+    },
+]
+
+
+def build(spec, template):
+    p = copy.deepcopy(template)
+    p["id"] = spec["id"]
+    p["name"] = spec["name"]
+    p["description"] = spec["description"]
+    p["cpu"]["energyPerformancePreference"] = spec["epp"]
+    p["cpu"]["noTurbo"] = spec["noTurbo"]
+    p["odmProfile"] = {"name": spec["odm"]} if spec["odm"] else {}
+    return p
+
+
+def main():
+    if os.geteuid() != 0:
+        print("must run as root", file=sys.stderr)
+        sys.exit(1)
+
+    remove = "--remove" in sys.argv
+    profiles = json.loads(Path(PROFILES_FILE).read_text())
+
+    if not Path(BACKUP).exists():
+        shutil.copy(PROFILES_FILE, BACKUP)
+        print(f"backed up original profiles to {BACKUP}")
+
+    cleaned = [p for p in profiles if not (p.get("id") or "").startswith("powertux-")]
+    removed = len(profiles) - len(cleaned)
+
+    if remove:
+        final = cleaned
+        msg = f"removed {removed} powertux profile(s); {len(cleaned)} remaining"
+    else:
+        if not cleaned:
+            print("no non-powertux profiles to clone from; aborting", file=sys.stderr)
+            sys.exit(1)
+        template = cleaned[0]
+        new = [build(s, template) for s in SPECS]
+        final = cleaned + new
+        msg = (
+            f"installed {len(SPECS)} powertux profile(s); "
+            f"replaced {removed} pre-existing; "
+            f"{len(final)} total profiles in file"
+        )
+
+    Path(PROFILES_FILE).write_text(json.dumps(final, indent=2))
+    print(msg)
+    print("restarting tccd...")
+    subprocess.run(["systemctl", "restart", "tccd"], check=True)
+    print("done")
+
+
+if __name__ == "__main__":
+    main()

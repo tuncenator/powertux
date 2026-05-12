@@ -1,0 +1,23 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Runtime telemetry written by powertux-autod (regenerates daily).
+# Calibration JSONs under results/ ARE tracked - they document the
+# empirical baseline behind the 4 tiers.
+log/
+*.jsonl
+*.jsonl.gz
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Ad-hoc scratch
+scratch/
+tmp/
+*.bak

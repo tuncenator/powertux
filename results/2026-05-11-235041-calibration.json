@@ -1,0 +1,116 @@
+{
+  "timestamp": "2026-05-11-235041",
+  "ac_online": "1",
+  "host": "ARCHON",
+  "kernel": "6.18.26-1-MANJARO",
+  "results": [
+    {
+      "candidate": {
+        "name": "S-lp-BP-b0",
+        "pp": "low-power",
+        "epp": "balance_performance",
+        "boost": 0
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 4.53,
+        "freq_mhz_mean": 1300.0,
+        "freq_mhz_max": 2010.0,
+        "temp_c_mean": 44.4,
+        "temp_c_max": 45.0,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.1,
+        "package_w": 18.43,
+        "freq_mhz_mean": 1929.0,
+        "freq_mhz_max": 2014.0,
+        "temp_c_mean": 49.7,
+        "temp_c_max": 53.6,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 75892
+    },
+    {
+      "candidate": {
+        "name": "M-lp-pf-b0",
+        "pp": "low-power",
+        "epp": "performance",
+        "boost": 0
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 5.03,
+        "freq_mhz_mean": 1169.0,
+        "freq_mhz_max": 1599.0,
+        "temp_c_mean": 45.4,
+        "temp_c_max": 46.0,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.1,
+        "package_w": 18.54,
+        "freq_mhz_mean": 1958.0,
+        "freq_mhz_max": 2013.0,
+        "temp_c_mean": 50.4,
+        "temp_c_max": 54.2,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 76070
+    },
+    {
+      "candidate": {
+        "name": "M-bal-pf-b0",
+        "pp": "balanced",
+        "epp": "performance",
+        "boost": 0
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 4.84,
+        "freq_mhz_mean": 1302.0,
+        "freq_mhz_max": 1930.0,
+        "temp_c_mean": 45.1,
+        "temp_c_max": 45.8,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.1,
+        "package_w": 18.5,
+        "freq_mhz_mean": 1933.0,
+        "freq_mhz_max": 2013.0,
+        "temp_c_mean": 50.3,
+        "temp_c_max": 54.2,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 75982
+    },
+    {
+      "candidate": {
+        "name": "B-perf-BP",
+        "pp": "performance",
+        "epp": "balance_performance",
+        "boost": 1
+      },
+      "idle": {
+        "duration_s": 20.03,
+        "package_w": 5.34,
+        "freq_mhz_mean": 1143.0,
+        "freq_mhz_max": 1671.0,
+        "temp_c_mean": 46.0,
+        "temp_c_max": 48.1,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.08,
+        "package_w": 47.46,
+        "freq_mhz_mean": 3118.0,
+        "freq_mhz_max": 3795.0,
+        "temp_c_mean": 68.8,
+        "temp_c_max": 80.6,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 112440
+    }
+  ]
+}

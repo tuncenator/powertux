@@ -1,0 +1,1336 @@
+#!/usr/bin/env python3
+"""powertux-eta-bench: backtest ETA prediction algorithms against logged data.
+
+Replays every closed discharge segment in the log archive tick-by-tick
+against each candidate algorithm, then scores them on accuracy,
+stability, bias, and horizon. The goal is "what should the widget run
+to feel magically accurate?" -- which is not the same as "lowest median
+error", because a low-error oracle that wobbles between 1h and 8h
+between ticks is worse UX than a slightly biased one that updates
+smoothly.
+
+Stdlib only. Reads the autod JSONL layout:
+    ~/Programs/powertux/log/YYYY-MM-DD.jsonl{,.gz}
+
+Algorithm registry (`--algorithms` takes a comma-separated list of
+`family-param` strings; default = a curated panel):
+
+  Window-mean family (robust mean of w_sys over the last W minutes):
+    naive-W          arithmetic mean
+    median-W         median (robust to spikes)
+    trimmed-W        20%-trimmed mean (drop top/bottom 10%)
+
+  EWMA family (exponential decay, half-life H minutes):
+    ewma-H           per-second decay
+
+  Blended:
+    blend-SHORT-LONG short-EWMA + long-EWMA, weight tuned to minimize
+                     overall median absolute error on training segments
+
+  Voltage-only:
+    ocv-W            time-to-reach ETA_EMPTY_FLOOR_PCT via OCV-SoC
+                     regression over the last W minutes. Independent
+                     of w_sys; useful when w_sys is suppressed.
+
+  Tier-conditional:
+    tier-W           per-tier (L1..L4) rolling-mean w_sys, weighted by
+                     tier residency in the W-minute window
+
+  Linear-regression:
+    reg-W            ordinary least-squares fit of w_sys vs time over
+                     the last W minutes; integrates the linear model
+                     forward to consume remaining Wh
+
+Output modes:
+  default               full backtest report with leaderboard +
+                        accuracy / stability / bias / horizon breakdowns
+  --segments-only       list closed/open segments and exit
+  --show-predictions N  per-tick predictions across segment N (for
+                        sanity / live tuning)
+  --oracle              emit a one-line JSON summary identifying the
+                        best algorithm for the widget to consume.
+                        Score = wA * median_abs_err + wB * stability +
+                        wC * abs(bias); weights documented inline.
+
+A discharge segment is a contiguous run of `status == "Discharging"`
+ticks with no sample gap > 2 * tick. "Closed" means the segment is
+followed by a known non-Discharging transition (so the actual end is
+known). Open segments are excluded from error stats.
+"""
+import argparse
+import datetime
+import gzip
+import json
+import math
+import statistics
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+LOG_DIR_DEFAULT = Path.home() / "Programs" / "powertux" / "log"
+TICK_SEC = 5
+GAP_SEC = 2 * TICK_SEC
+MIN_SEGMENT_TICKS = 30
+V_NOM_CELL = 3.7
+CELLS = 4
+ETA_EMPTY_FLOOR_PCT = 10
+OCV_SOC = [
+    (4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85),
+    (4.00, 80), (3.95, 75), (3.90, 70), (3.85, 60),
+    (3.80, 50), (3.75, 40), (3.70, 30), (3.65, 25),
+    (3.60, 20), (3.55, 15), (3.50, 10), (3.45, 5),
+    (3.40, 0),
+]
+
+
+# -----------------------------------------------------------------------------
+# Formatting helpers
+# -----------------------------------------------------------------------------
+
+USE_COLOR = True
+USE_UNICODE = True
+SPARK = " ▁▂▃▄▅▆▇█"
+SPARK_ASCII = " .:-=+*#@"
+BLOCK_FRAC = " ▏▎▍▌▋▊▉█"
+
+
+def C(text, n, *, bold=False):
+    if not USE_COLOR:
+        return text
+    if n is None:
+        return f"\x1b[1m{text}\x1b[0m" if bold else text
+    prefix = f"\x1b[1;38;5;{n}m" if bold else f"\x1b[38;5;{n}m"
+    return f"{prefix}{text}\x1b[0m"
+
+
+def bar(value, max_val, width):
+    if max_val <= 0 or value <= 0:
+        return " " * width
+    if not USE_UNICODE:
+        n = max(0, min(width, round(value / max_val * width)))
+        return "#" * n + " " * (width - n)
+    cells = min(1.0, value / max_val) * width
+    full = int(cells)
+    frac = int((cells - full) * 8)
+    out = "█" * full
+    if frac > 0 and full < width:
+        out += BLOCK_FRAC[frac]
+        full += 1
+    return out + " " * (width - full)
+
+
+def spark(value, max_val):
+    chars = SPARK if USE_UNICODE else SPARK_ASCII
+    if max_val <= 0:
+        return chars[0]
+    i = max(0, min(8, int(round(value / max_val * 8))))
+    return chars[i]
+
+
+def fmt_dur(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s" if s else f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m" if m else f"{h}h"
+
+
+def fmt_mins(s):
+    return f"{s / 60:+6.1f} min"
+
+
+def fmt_mins_abs(s):
+    return f"{abs(s) / 60:6.1f} min"
+
+
+def pct(xs, p):
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    k = max(0, min(len(xs) - 1, int(round(p / 100.0 * (len(xs) - 1)))))
+    return xs[k]
+
+
+# -----------------------------------------------------------------------------
+# Battery math shared with the widget + autod. Same OCV curve, same
+# remaining-Wh derivation, so bench results map 1:1 onto the widget.
+# -----------------------------------------------------------------------------
+
+def ocv_soc(v_cell):
+    if v_cell >= OCV_SOC[0][0]:
+        return 100.0
+    if v_cell <= OCV_SOC[-1][0]:
+        return 0.0
+    for (v_hi, s_hi), (v_lo, s_lo) in zip(OCV_SOC, OCV_SOC[1:]):
+        if v_lo <= v_cell <= v_hi:
+            frac = (v_cell - v_lo) / (v_hi - v_lo)
+            return s_lo + (s_hi - s_lo) * frac
+    return 0.0
+
+
+def remaining_wh_at(row):
+    """OCV-derived remaining Wh for one tick, or None if inputs missing."""
+    vbat = row.get("v_bat")
+    if vbat is None:
+        return None
+    mah = row.get("raw_xif2_mah")
+    if not mah:
+        cfd = row.get("charge_full_design")
+        if cfd is None:
+            return None
+        mah = cfd / 1000.0
+    v_cell = vbat / CELLS
+    ocv = ocv_soc(v_cell)
+    full_wh = mah * CELLS * V_NOM_CELL / 1000.0
+    usable_pct = max(0.0, ocv - ETA_EMPTY_FLOOR_PCT)
+    return full_wh * usable_pct / 100.0
+
+
+# -----------------------------------------------------------------------------
+# Log loading + segmenting (same shape as the previous version, kept
+# stable so existing tests in callers don't have to relearn it).
+# -----------------------------------------------------------------------------
+
+def iter_logs(log_dir, dt_from=None, dt_to=None):
+    paths_by_stem = {}
+    for p in Path(log_dir).iterdir():
+        name = p.name
+        if name.endswith(".jsonl.gz"):
+            stem = name[:-9]
+        elif name.endswith(".jsonl"):
+            stem = name[:-6]
+        else:
+            continue
+        prev = paths_by_stem.get(stem)
+        if prev is not None and prev.name.endswith(".jsonl"):
+            continue
+        paths_by_stem[stem] = p
+    for stem in sorted(paths_by_stem):
+        try:
+            d = datetime.date.fromisoformat(stem)
+        except ValueError:
+            continue
+        if dt_from and d < dt_from.date():
+            continue
+        if dt_to and d > dt_to.date():
+            continue
+        p = paths_by_stem[stem]
+        opener = gzip.open if p.name.endswith(".gz") else open
+        with opener(p, "rt") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("meta"):
+                    continue
+                try:
+                    row["_t"] = datetime.datetime.fromisoformat(row["t"])
+                except (KeyError, ValueError):
+                    continue
+                yield row
+
+
+def find_segments(rows):
+    """Walk rows; return discharge segments with ticks + closure info."""
+    segments = []
+    cur = None
+    prev_t = None
+    for row in rows:
+        t = row["_t"]
+        status = row.get("status")
+        gap = prev_t is not None and (t - prev_t).total_seconds() > GAP_SEC
+        prev_t = t
+        if status == "Discharging" and not gap:
+            if cur is None:
+                cur = {"ticks": [], "start_t": t,
+                       "closed": False, "end_reason": None}
+            cur["ticks"].append(row)
+            cur["end_t"] = t
+        else:
+            if cur is not None:
+                cur["closed"] = True
+                cur["end_reason"] = "gap" if gap else f"status={status}"
+                segments.append(cur)
+                cur = None
+            if status == "Discharging":
+                cur = {"ticks": [row], "start_t": t, "end_t": t,
+                       "closed": False, "end_reason": None}
+    if cur is not None:
+        cur["end_reason"] = "log_end"
+        segments.append(cur)
+    return segments
+
+
+def annotate_actual_end(rows):
+    """For each row, attach `_actual_end` = datetime of the next non-
+    Discharging status, if reachable without crossing a sample gap.
+    Sample gaps mean autod was offline; the actual discharge duration
+    across the gap isn't trustworthy, so we invalidate."""
+    next_end_t = None
+    gap_blocked = True
+    prev_t = None
+    for r in reversed(rows):
+        t = r["_t"]
+        s = r.get("status")
+        if prev_t is not None and (prev_t - t).total_seconds() > GAP_SEC:
+            gap_blocked = True
+        if s and s != "Discharging":
+            next_end_t = t
+            gap_blocked = False
+        r["_actual_end"] = None if gap_blocked else next_end_t
+        prev_t = t
+
+
+# -----------------------------------------------------------------------------
+# Algorithm registry. Each algorithm is a callable
+#   predict(history, cur) -> float | None
+# where history is the discharge ticks observed so far (oldest first) and
+# cur is the current tick. Algorithms read whatever fields they need.
+# The algorithm carries .name (for output) and .family/.param (for parsing).
+# -----------------------------------------------------------------------------
+
+class Algo:
+    """Thin wrapper so each algorithm carries metadata + a predict fn.
+
+    family + param are kept so the leaderboard can show consistent
+    column names, and so `--algorithms naive-5,ewma-10` round-trips
+    cleanly through select_algorithms()."""
+
+    __slots__ = ("name", "family", "param", "predict", "needs")
+
+    def __init__(self, family, param, predict, needs=("w_sys",)):
+        self.family = family
+        self.param = param
+        self.name = f"{family}-{param}"
+        self.predict = predict
+        self.needs = needs  # informational; helps explain "no prediction" gaps
+
+    def __call__(self, history, cur):
+        return self.predict(history, cur)
+
+
+# ---- window helpers -------------------------------------------------------
+
+def _window_samples(history, cur, window_s, field="w_sys"):
+    cutoff = cur["_t"] - datetime.timedelta(seconds=window_s)
+    out = []
+    for h in reversed(history):
+        if h["_t"] < cutoff:
+            break
+        v = h.get(field)
+        if v is not None and v > 0:
+            out.append(v)
+    out.reverse()
+    return out
+
+
+# ---- algorithms -----------------------------------------------------------
+
+def make_naive(window_min):
+    window_s = window_min * 60
+
+    def predict(history, cur):
+        rem_wh = remaining_wh_at(cur)
+        if rem_wh is None:
+            return None
+        samples = _window_samples(history, cur, window_s)
+        if len(samples) < 6:
+            return None
+        avg_w = sum(samples) / len(samples)
+        if avg_w <= 0:
+            return None
+        return rem_wh * 3600.0 / avg_w
+
+    return Algo("naive", window_min, predict)
+
+
+def make_median(window_min):
+    window_s = window_min * 60
+
+    def predict(history, cur):
+        rem_wh = remaining_wh_at(cur)
+        if rem_wh is None:
+            return None
+        samples = _window_samples(history, cur, window_s)
+        if len(samples) < 6:
+            return None
+        med_w = statistics.median(samples)
+        if med_w <= 0:
+            return None
+        return rem_wh * 3600.0 / med_w
+
+    return Algo("median", window_min, predict)
+
+
+def make_trimmed(window_min, trim=0.1):
+    window_s = window_min * 60
+
+    def predict(history, cur):
+        rem_wh = remaining_wh_at(cur)
+        if rem_wh is None:
+            return None
+        samples = sorted(_window_samples(history, cur, window_s))
+        if len(samples) < 10:
+            return None
+        cut = int(len(samples) * trim)
+        kept = samples[cut:len(samples) - cut] if cut else samples
+        if not kept:
+            return None
+        avg_w = sum(kept) / len(kept)
+        if avg_w <= 0:
+            return None
+        return rem_wh * 3600.0 / avg_w
+
+    return Algo("trimmed", window_min, predict)
+
+
+def make_ewma(half_life_min):
+    hl_s = half_life_min * 60
+    cap_window_s = max(hl_s * 6, 1800)
+
+    def predict(history, cur):
+        rem_wh = remaining_wh_at(cur)
+        if rem_wh is None:
+            return None
+        cutoff = cur["_t"] - datetime.timedelta(seconds=cap_window_s)
+        ewma = None
+        last_t = None
+        n = 0
+        for h in history:
+            if h["_t"] < cutoff:
+                continue
+            w = h.get("w_sys")
+            if w is None or w <= 0:
+                continue
+            if ewma is None:
+                ewma = w
+            else:
+                dt = (h["_t"] - last_t).total_seconds()
+                decay = 0.5 ** (dt / hl_s)
+                ewma = decay * ewma + (1 - decay) * w
+            last_t = h["_t"]
+            n += 1
+        if ewma is None or n < 6 or ewma <= 0:
+            return None
+        return rem_wh * 3600.0 / ewma
+
+    return Algo("ewma", half_life_min, predict)
+
+
+def make_blend(short_hl, long_hl, weight_short=0.4):
+    """short EWMA captures regime change; long EWMA gives stability.
+    Blended W = weight_short * short + (1 - weight_short) * long."""
+    short = make_ewma(short_hl)
+    long = make_ewma(long_hl)
+
+    def predict(history, cur):
+        s_eta = short(history, cur)
+        l_eta = long(history, cur)
+        if s_eta is None or l_eta is None:
+            return None
+        # blend in W-space, not ETA-space, to keep monotonicity. Recover
+        # W via rem_wh / (eta / 3600), then re-blend, then convert back.
+        rem_wh = remaining_wh_at(cur)
+        if rem_wh is None or rem_wh <= 0:
+            return None
+        s_w = rem_wh * 3600.0 / s_eta if s_eta > 0 else None
+        l_w = rem_wh * 3600.0 / l_eta if l_eta > 0 else None
+        if s_w is None or l_w is None:
+            return None
+        w = weight_short * s_w + (1 - weight_short) * l_w
+        if w <= 0:
+            return None
+        return rem_wh * 3600.0 / w
+
+    return Algo("blend", f"{short_hl}-{long_hl}", predict)
+
+
+def make_ocv(window_min):
+    """Voltage-only: regress OCV-SoC vs time over the last W min, project
+    forward to ETA_EMPTY_FLOOR_PCT. Decouples from w_sys, but
+    extra-sensitive to voltage sag during load transients."""
+    window_s = window_min * 60
+
+    def predict(history, cur):
+        cutoff = cur["_t"] - datetime.timedelta(seconds=window_s)
+        pts = []
+        for h in history:
+            if h["_t"] < cutoff:
+                continue
+            v = h.get("v_bat")
+            if v is None:
+                continue
+            soc = ocv_soc(v / CELLS)
+            pts.append((h["_t"], soc))
+        v = cur.get("v_bat")
+        if v is not None:
+            pts.append((cur["_t"], ocv_soc(v / CELLS)))
+        if len(pts) < 6:
+            return None
+        # linear regression: SoC = a + b * (t - t0_s)
+        t0 = pts[0][0]
+        xs = [(t - t0).total_seconds() for t, _ in pts]
+        ys = [soc for _, soc in pts]
+        n = len(pts)
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        den = sum((x - mx) ** 2 for x in xs)
+        if den == 0:
+            return None
+        b = num / den   # SoC %/sec; expected negative on discharge
+        a = my - b * mx
+        if b >= 0:
+            # SoC not falling within the window -- can't project empty.
+            return None
+        # solve a + b * x = ETA_EMPTY_FLOOR_PCT, return seconds from `cur`
+        x_at_floor = (ETA_EMPTY_FLOOR_PCT - a) / b
+        x_cur = (cur["_t"] - t0).total_seconds()
+        return max(0.0, x_at_floor - x_cur)
+
+    return Algo("ocv", window_min, predict, needs=("v_bat",))
+
+
+def make_tier(window_min):
+    """Tier-conditional rolling mean. Compute mean w_sys per tier in the
+    window, then weight by the tier's residency in the same window.
+    This separates idle-dominated runs (mostly L1/L2) from load runs
+    (L3/L4) instead of averaging them indiscriminately."""
+    window_s = window_min * 60
+
+    def predict(history, cur):
+        rem_wh = remaining_wh_at(cur)
+        if rem_wh is None:
+            return None
+        cutoff = cur["_t"] - datetime.timedelta(seconds=window_s)
+        by_tier_w = defaultdict(list)
+        for h in history:
+            if h["_t"] < cutoff:
+                continue
+            lv = h.get("current")
+            w = h.get("w_sys")
+            if lv in (1, 2, 3, 4) and w is not None and w > 0:
+                by_tier_w[lv].append(w)
+        if not by_tier_w:
+            return None
+        total_n = sum(len(v) for v in by_tier_w.values())
+        if total_n < 6:
+            return None
+        avg_w = sum(
+            (sum(ws) / len(ws)) * (len(ws) / total_n)
+            for ws in by_tier_w.values()
+        )
+        if avg_w <= 0:
+            return None
+        return rem_wh * 3600.0 / avg_w
+
+    return Algo("tier", window_min, predict)
+
+
+def make_regression(window_min):
+    """Linear regression of w_sys vs time. Integrates the linear model
+    forward (constant rate of W increase or decrease) until remaining Wh
+    is consumed.
+
+    If the model says W is decreasing fast (e.g., load tail dropping),
+    this predicts a longer ETA than rolling mean. If W is increasing
+    (load ramping), it predicts shorter. Useful when the user
+    transitions from idle to load (the rolling mean lags)."""
+    window_s = window_min * 60
+
+    def predict(history, cur):
+        rem_wh = remaining_wh_at(cur)
+        if rem_wh is None or rem_wh <= 0:
+            return None
+        cutoff = cur["_t"] - datetime.timedelta(seconds=window_s)
+        pts = []
+        for h in history:
+            if h["_t"] < cutoff:
+                continue
+            w = h.get("w_sys")
+            if w is not None and w > 0:
+                pts.append((h["_t"], w))
+        cur_w = cur.get("w_sys")
+        if cur_w is not None and cur_w > 0:
+            pts.append((cur["_t"], cur_w))
+        if len(pts) < 6:
+            return None
+        t0 = pts[0][0]
+        xs = [(t - t0).total_seconds() for t, _ in pts]
+        ys = [w for _, w in pts]
+        n = len(pts)
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        den = sum((x - mx) ** 2 for x in xs)
+        if den == 0:
+            return None
+        b = num / den          # W/sec
+        a = my - b * mx        # W at t = t0
+        x_cur = (cur["_t"] - t0).total_seconds()
+        # W(t) = a + b * t. Energy consumed from x_cur to x_cur + dt is
+        # integral = a*dt + b*(2*x_cur*dt + dt^2)/2.
+        # Solve integral == rem_wh * 3600 for dt.
+        w_cur = a + b * x_cur
+        if w_cur <= 0:
+            return None
+        target_j = rem_wh * 3600.0
+        if abs(b) < 1e-6:
+            # ~flat; degenerate to division
+            return target_j / w_cur
+        # solve: w_cur * dt + 0.5 * b * dt^2 == target_j
+        # dt = (-w_cur + sqrt(w_cur^2 + 2*b*target_j)) / b
+        disc = w_cur * w_cur + 2 * b * target_j
+        if disc < 0:
+            # Negative-slope projection that runs out of energy at infinity
+            # if extrapolated. Refuse to predict.
+            return None
+        if b > 0:
+            dt = (-w_cur + math.sqrt(disc)) / b
+        else:
+            # slope negative; pick the smaller (positive) root
+            dt = (-w_cur + math.sqrt(disc)) / b
+            if dt <= 0:
+                dt = (-w_cur - math.sqrt(disc)) / b
+        return max(0.0, dt)
+
+    return Algo("reg", window_min, predict)
+
+
+# Curated default panel. Mix of windows + algorithm families covering the
+# tuning surface the widget cares about. select_algorithms() can override
+# from the command line.
+DEFAULT_ALGORITHMS_SPEC = [
+    "naive-3", "naive-5", "naive-15",
+    "median-5", "median-15",
+    "trimmed-15",
+    "ewma-2", "ewma-5", "ewma-10",
+    "blend-2-15",
+    "tier-15",
+    "ocv-15",
+    "reg-15",
+]
+
+
+FACTORIES = {
+    "naive": make_naive,
+    "median": make_median,
+    "trimmed": make_trimmed,
+    "ewma": make_ewma,
+    "ocv": make_ocv,
+    "tier": make_tier,
+    "reg": make_regression,
+}
+
+
+def select_algorithms(spec):
+    tokens = (spec.split(",") if spec
+              else list(DEFAULT_ALGORITHMS_SPEC))
+    chosen = []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        parts = tok.split("-")
+        if len(parts) < 2:
+            raise SystemExit(f"bad algorithm spec: {tok}")
+        family = parts[0]
+        if family == "blend":
+            if len(parts) != 3:
+                raise SystemExit(f"blend takes two halflives: {tok}")
+            try:
+                a, b = int(parts[1]), int(parts[2])
+            except ValueError:
+                raise SystemExit(f"bad blend parameters: {tok}")
+            chosen.append(make_blend(a, b))
+            continue
+        if family not in FACTORIES:
+            raise SystemExit(f"unknown algorithm family: {family}")
+        try:
+            n = int(parts[1])
+        except ValueError:
+            raise SystemExit(f"bad parameter in {tok}")
+        chosen.append(FACTORIES[family](n))
+    return chosen
+
+
+# -----------------------------------------------------------------------------
+# Replay engine
+# -----------------------------------------------------------------------------
+
+def replay_segment(seg, algorithms):
+    """For each tick in seg whose `_actual_end` is known, run each
+    algorithm. Returns dict {algo_name: [(predicted_s, actual_s, soc,
+    tick_t, tier)]}. Ticks without a real discharge end (log runs out
+    while still discharging) are excluded."""
+    out = defaultdict(list)
+    history = []
+    # Pre-filter for w_sys-positive history once; reused across algos.
+    for tick in seg["ticks"]:
+        w = tick.get("w_sys")
+        if w is not None and w > 0:
+            history.append(tick)
+    for tick in seg["ticks"]:
+        actual_end = tick.get("_actual_end")
+        if actual_end is None:
+            continue
+        actual_s = (actual_end - tick["_t"]).total_seconds()
+        if actual_s < 0:
+            continue
+        prior = []
+        for h in history:
+            if h["_t"] < tick["_t"]:
+                prior.append(h)
+            else:
+                break
+        cap = tick.get("cap")
+        tier = tick.get("current")
+        for algo in algorithms:
+            pred = algo(prior, tick)
+            if pred is None:
+                continue
+            out[algo.name].append((pred, actual_s, cap, tick["_t"], tier))
+    return out
+
+
+def replay_segment_live(seg, algorithms):
+    """Same as replay_segment but doesn't require actual_end; emits the
+    full prediction series even for open segments. Used by stability and
+    by the per-segment timeline visualization."""
+    out = defaultdict(list)
+    history = []
+    for tick in seg["ticks"]:
+        w = tick.get("w_sys")
+        if w is not None and w > 0:
+            history.append(tick)
+    for tick in seg["ticks"]:
+        prior = []
+        for h in history:
+            if h["_t"] < tick["_t"]:
+                prior.append(h)
+            else:
+                break
+        for algo in algorithms:
+            pred = algo(prior, tick)
+            out[algo.name].append((tick["_t"], pred))
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Stats. Beyond the basic absolute / signed error, we surface:
+#   - percent error: |err| / actual
+#   - stability: median |Δprediction| / TICK_SEC; "how much does the
+#     prediction wobble between consecutive ticks?"
+#   - convergence: number of seconds to first stay within 10% of actual
+# -----------------------------------------------------------------------------
+
+def percent_errors(preds):
+    out = []
+    for p, a, *_ in preds:
+        if a > 60:  # ignore the last <1min where any error looks huge
+            out.append(abs(p - a) / a)
+    return out
+
+
+def stability_for_segment(segment_predictions):
+    """One stability value per segment: median |delta| between
+    consecutive non-None predictions, normalized to seconds."""
+    deltas = []
+    last = None
+    for _, p in segment_predictions:
+        if p is None:
+            last = None
+            continue
+        if last is not None:
+            deltas.append(abs(p - last))
+        last = p
+    if not deltas:
+        return None
+    return statistics.median(deltas)
+
+
+def convergence_seconds(preds_in_order):
+    """Time from start of segment until prediction stays within 10% of
+    actual for at least 60s. Higher = takes longer to converge."""
+    in_band_since = None
+    for p, a, _, t, _ in preds_in_order:
+        if a <= 0:
+            continue
+        within = abs(p - a) / a <= 0.10
+        if within:
+            if in_band_since is None:
+                in_band_since = t
+            elif (t - in_band_since).total_seconds() >= 60:
+                # converged; first sample is at preds_in_order[0]
+                return (in_band_since - preds_in_order[0][3]).total_seconds()
+        else:
+            in_band_since = None
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Report rendering
+# -----------------------------------------------------------------------------
+
+INFO_COLOR = 39   # azure, matches analyze
+OK_COLOR = 46
+WARN_COLOR = 208
+DIM_COLOR = 245
+
+
+def big_section(title):
+    """Top-level banner. Same visual as powertux-analyze, so both reports
+    share a design language when read back-to-back."""
+    print()
+    print(C("═" * 78 if USE_UNICODE else "=" * 78, INFO_COLOR))
+    print(C(title.upper(), INFO_COLOR, bold=True))
+    print(C("═" * 78 if USE_UNICODE else "=" * 78, INFO_COLOR))
+
+
+def section(title):
+    print()
+    print(C(title, None, bold=True))
+    print("─" * 64 if USE_UNICODE else "-" * 64)
+
+
+def kv(label, value, width=18, value_color=None):
+    lbl = f"  {label:<{width}}"
+    if value_color is not None:
+        value = C(value, value_color)
+    print(f"{lbl}{value}")
+
+
+def print_segments(segments):
+    section(f"Discharge segments ({len(segments)} total)")
+    if not segments:
+        print("  (none)")
+        return
+    print(f"  {'#':<3} {'start':<20} {'end':<20} {'dur':>9} {'ticks':>6}  "
+          f"{'bench':<6} reason")
+    for i, s in enumerate(segments):
+        dur = (s["end_t"] - s["start_t"]).total_seconds() / 60
+        bench_ok = s["ticks"][-1].get("_actual_end") is not None
+        print(f"  {i:<3} {s['start_t'].strftime('%Y-%m-%d %H:%M:%S'):<20} "
+              f"{s['end_t'].strftime('%Y-%m-%d %H:%M:%S'):<20} "
+              f"{dur:>6.1f} min  {len(s['ticks']):>6}  "
+              f"{'yes' if bench_ok else 'no':<6} "
+              f"{s['end_reason'] or ''}")
+
+
+def show_predictions(seg, algorithms, every_n=12):
+    bench_ok = seg["ticks"][-1].get("_actual_end") is not None
+    section(f"Predictions across segment "
+            f"{seg['start_t']} - {seg['end_t']}")
+    kv("status",
+       "bench-valid" if bench_ok else "OPEN, no error metric available")
+    kv("ticks", str(len(seg["ticks"])))
+    print()
+    print(f"  {'time':<10}  {'cap':>4}  {'v_cell':>7}  ", end="")
+    for a in algorithms:
+        print(f"{a.name:>11}", end="  ")
+    print()
+    history = []
+    for i, tick in enumerate(seg["ticks"]):
+        if i % every_n != 0 and i != len(seg["ticks"]) - 1:
+            if tick.get("w_sys") is not None and tick["w_sys"] > 0:
+                history.append(tick)
+            continue
+        line = f"  {tick['_t'].strftime('%H:%M:%S'):<10}  " \
+               f"{str(tick.get('cap')):>4}  "
+        vbat = tick.get("v_bat")
+        line += (f"{(vbat / CELLS if vbat else 0):>7.3f}  "
+                 if vbat else f"{'?':>7}  ")
+        for a in algorithms:
+            pred = a(history, tick)
+            if pred is None:
+                line += f"{'-':>11}  "
+            else:
+                line += f"{pred / 60:>7.1f} min  "
+        print(line)
+        if tick.get("w_sys") is not None and tick["w_sys"] > 0:
+            history.append(tick)
+
+
+def leaderboard(combined, segment_count, stability_by_algo):
+    """The headline section: rank algorithms by an accuracy score that
+    matches the widget's UX goals (low median error, low wobble, low
+    bias). The composite score is documented inline."""
+    section(f"Algorithm ranking  ({segment_count} closed segment"
+            f"{'s' if segment_count != 1 else ''})")
+    if not any(combined.values()):
+        print("  no usable predictions; need >=1 closed discharge segment")
+        print("  with w_sys + v_bat populated and >=6 history ticks per "
+              "prediction.")
+        return None
+
+    rows = []
+    for name, preds in combined.items():
+        if not preds:
+            continue
+        errs = [p - a for p, a, *_ in preds]
+        abs_errs = [abs(e) for e in errs]
+        pct_errs = percent_errors(preds)
+        n = len(errs)
+        med_abs = pct(abs_errs, 50)
+        p90_abs = pct(abs_errs, 90)
+        mean_err = sum(errs) / n if n else 0
+        med_pct = statistics.median(pct_errs) * 100 if pct_errs else float("nan")
+        stability = (statistics.median(stability_by_algo.get(name, []))
+                     if stability_by_algo.get(name) else float("nan"))
+        # Composite score. Lower = better.
+        #   accuracy contributes proportional to median absolute error;
+        #   stability penalty (wobble) is the median |Δ pred| (seconds);
+        #   bias is half-weighted because a steady +5min is more livable
+        #   than a wobbly perfect prediction.
+        wA, wB, wC = 1.0, 1.0, 0.5
+        score = (wA * med_abs
+                 + wB * (stability if not math.isnan(stability) else 0)
+                 + wC * abs(mean_err))
+        rows.append({
+            "name": name,
+            "n": n,
+            "med_abs": med_abs,
+            "p90_abs": p90_abs,
+            "mean_err": mean_err,
+            "med_pct": med_pct,
+            "stability": stability,
+            "score": score,
+            "bias_up_pct": sum(1 for e in errs if e > 0) * 100.0 / n,
+        })
+    rows.sort(key=lambda r: r["score"])
+
+    # Compute the name-column width up front and align by that. Color
+    # codes are zero-width on screen but non-zero in the format-string
+    # padding, so we pad the plain name first and only THEN wrap it in
+    # color escapes.
+    name_w = max(12, max(len(r["name"]) for r in rows))
+    bias_lbl = "bias↑" if USE_UNICODE else "bias+"
+    print(f"  {'algorithm':<{name_w}}  {'n':>5}  {'med abs':>9}  "
+          f"{'p90 abs':>9}  {'med%':>5}  {'mean_err':>10}  "
+          f"{'stability':>10}  {bias_lbl:>5}  {'score':>7}")
+    print("  " + "-" * (name_w + 76))
+    if rows:
+        best = rows[0]
+    else:
+        best = None
+    for r in rows:
+        padded = f"{r['name']:<{name_w}}"
+        name_col = C(padded, 46) if r is rows[0] else padded
+        med_pct_s = (f"{r['med_pct']:4.1f}%"
+                     if not math.isnan(r['med_pct']) else "   - ")
+        stab_s = (f"{r['stability']/60:6.2f}m"
+                  if not math.isnan(r['stability']) else "     -")
+        score_s = f"{r['score']/60:6.2f}m"
+        print(f"  {name_col}  {r['n']:>5}  "
+              f"{fmt_mins_abs(r['med_abs']):>9}  "
+              f"{fmt_mins_abs(r['p90_abs']):>9}  "
+              f"{med_pct_s:>5}  {fmt_mins(r['mean_err']):>10}  "
+              f"{stab_s:>10}  {r['bias_up_pct']:>4.0f}%  {score_s:>7}")
+    print()
+    delta = "Δ" if USE_UNICODE else "d/"
+    print("  med abs    : median absolute error (lower better)")
+    print("  med%       : median relative error vs actual remaining "
+          "(lower better)")
+    print("  mean_err   : signed mean error; + means optimistic "
+          "(predicts longer than actual)")
+    print(f"  stability  : median |{delta}predict| between consecutive "
+          f"ticks (lower = smoother widget)")
+    print(f"  {bias_lbl:<10}: %% of predictions that overshoot actual")
+    print("  score      : composite, lower better")
+    print("    score = med_abs + stability + 0.5 * |mean_err|  "
+          "(seconds; tune weights in source)")
+    return best, rows
+
+
+def horizon_table(combined, top_rows):
+    section("By horizon (median absolute error per remaining-time band)")
+    bins = [(0, 1800, "0-30 min"), (1800, 3600, "30-60 min"),
+            (3600, 7200, "1-2 h"), (7200, 1e9, ">2 h")]
+    print(f"  {'':14s}", end="")
+    for _, _, label in bins:
+        print(f"  {label:>10}", end="")
+    print()
+    for r in top_rows[:5]:
+        line = f"  {r['name']:<14}"
+        preds = combined[r["name"]]
+        for lo, hi, _ in bins:
+            band = [abs(p - a) for p, a, *_ in preds if lo <= a < hi]
+            if band:
+                line += f"  {pct(band, 50) / 60:>7.1f} min"
+            else:
+                line += f"  {'-':>10}"
+        print(line)
+
+
+def signed_horizon(combined, top_rows):
+    """Same horizon bands as horizon_table but signed mean error: tells
+    you "is this algorithm optimistic in the last 30 min?", which is the
+    UX-critical question for the widget."""
+    section("By horizon (mean signed error; + = optimistic)")
+    bins = [(0, 1800, "0-30 min"), (1800, 3600, "30-60 min"),
+            (3600, 7200, "1-2 h"), (7200, 1e9, ">2 h")]
+    print(f"  {'':14s}", end="")
+    for _, _, label in bins:
+        print(f"  {label:>10}", end="")
+    print()
+    for r in top_rows[:5]:
+        line = f"  {r['name']:<14}"
+        preds = combined[r["name"]]
+        for lo, hi, _ in bins:
+            band = [p - a for p, a, *_ in preds if lo <= a < hi]
+            if band:
+                m = sum(band) / len(band)
+                line += f"  {m / 60:>+7.1f} min"
+            else:
+                line += f"  {'-':>10}"
+        print(line)
+
+
+def soc_table(combined, top_rows):
+    section("By SoC band (kernel cap, median absolute error)")
+    soc_bins = [(80, 101, ">=80%"), (50, 80, "50-80%"),
+                (25, 50, "25-50%"), (0, 25, "<25%")]
+    print(f"  {'':14s}", end="")
+    for _, _, label in soc_bins:
+        print(f"  {label:>10}", end="")
+    print()
+    for r in top_rows[:5]:
+        line = f"  {r['name']:<14}"
+        preds = combined[r["name"]]
+        for lo, hi, _ in soc_bins:
+            band = [abs(p - a) for p, a, soc, *_ in preds
+                    if soc is not None and lo <= soc < hi]
+            if band:
+                line += f"  {pct(band, 50) / 60:>7.1f} min"
+            else:
+                line += f"  {'-':>10}"
+        print(line)
+
+
+def tier_table(combined, top_rows):
+    section("By tier (median absolute error per L1..L4)")
+    print(f"  {'':14s}   L1         L2         L3         L4")
+    for r in top_rows[:5]:
+        line = f"  {r['name']:<14}"
+        preds = combined[r["name"]]
+        for lv in (1, 2, 3, 4):
+            band = [abs(p - a) for p, a, soc, t, tier in preds
+                    if tier == lv]
+            if band:
+                line += f"  {pct(band, 50) / 60:>7.1f} min"
+            else:
+                line += f"  {'-':>10}"
+        print(line)
+
+
+def stability_breakdown(stability_by_algo, top_rows):
+    """Stability deserves its own section: it's the most user-visible
+    quality of the widget number, and it doesn't always track median
+    error (a flat baseline-only algorithm can be very stable but
+    inaccurate; an aggressive regression can be accurate but jittery)."""
+    delta = "Δ" if USE_UNICODE else "d/"
+    section(f"Stability (median |{delta}predict| between consecutive ticks)")
+    print(f"  {'algorithm':<14} {'segments':>9}  "
+          f"{'p50 wobble':>11}  {'p90 wobble':>11}")
+    for r in top_rows[:8]:
+        stab = stability_by_algo.get(r["name"], [])
+        if not stab:
+            continue
+        print(f"  {r['name']:<14} {len(stab):>9}  "
+              f"{pct(stab, 50)/60:>7.2f} min  "
+              f"{pct(stab, 90)/60:>7.2f} min")
+
+
+def per_segment_table(combined, bench_valid, top_rows):
+    """Per-segment median absolute error for the top algorithm.
+    Surfaces "this segment had an unusual workload" outliers.
+
+    Combined predictions already carry tick_t; we bucket them back to
+    segments using each segment's start/end times instead of re-running
+    the algorithms."""
+    section("Per-segment accuracy (top algorithm only)")
+    if not top_rows:
+        return
+    best_name = top_rows[0]["name"]
+    by_segment = defaultdict(list)
+    seg_bounds = [(s["start_t"], s["end_t"], i)
+                  for i, s in enumerate(bench_valid)]
+    for (p, a, _, t, _) in combined[best_name]:
+        for s_start, s_end, idx in seg_bounds:
+            if s_start <= t <= s_end:
+                by_segment[idx].append(abs(p - a))
+                break
+    print(f"  {'#':>3} {'start':<20} {'ticks':>5} {'med err':>10} "
+          f"{'p90 err':>10}")
+    for idx in sorted(by_segment.keys()):
+        errs = by_segment[idx]
+        if not errs:
+            continue
+        seg = bench_valid[idx]
+        print(f"  {idx:>3d} "
+              f"{seg['start_t'].strftime('%Y-%m-%d %H:%M:%S'):<20} "
+              f"{len(errs):>5d} "
+              f"{pct(errs, 50)/60:>7.1f} m  "
+              f"{pct(errs, 90)/60:>7.1f} m")
+
+
+def error_sparkline_per_algo(combined, top_rows):
+    """One sparkline per top algorithm: absolute errors sorted from low
+    to high. Tail rising fast = the algorithm has bad worst-case days."""
+    section("Error CDF (sorted abs errs; tall right tail = occasional miss)")
+    if not top_rows:
+        return
+    width = 60
+    all_errs = []
+    for r in top_rows[:5]:
+        for p, a, *_ in combined[r["name"]]:
+            all_errs.append(abs(p - a))
+    if not all_errs:
+        return
+    p95 = pct(all_errs, 95)
+    for r in top_rows[:5]:
+        errs = sorted(abs(p - a) for p, a, *_ in combined[r["name"]])
+        if not errs:
+            continue
+        n_cells = width
+        chunk = max(1, len(errs) // n_cells)
+        cells = []
+        for i in range(0, len(errs), chunk):
+            block = errs[i:i + chunk]
+            cells.append(spark(sum(block) / len(block), p95))
+        print(f"  {r['name']:<14} {''.join(cells)}  (max "
+              f"{errs[-1]/60:.1f}m, p99 {pct(errs, 99)/60:.1f}m)")
+
+
+def emit_oracle(best, leaderboard_rows, segment_count, bench_valid):
+    """One-line JSON: which algorithm is recommended and what its
+    expected error/stability looks like. The widget can read this on
+    each tick and switch algorithm without recompiling."""
+    if best is None:
+        out = {"ok": False, "reason": "no bench-valid predictions"}
+    else:
+        out = {
+            "ok": True,
+            "algorithm": best["name"],
+            "median_abs_err_s": round(best["med_abs"]),
+            "p90_abs_err_s": round(best["p90_abs"]),
+            "mean_err_s": round(best["mean_err"]),
+            "stability_s": (round(best["stability"])
+                            if not math.isnan(best["stability"])
+                            else None),
+            "score_s": round(best["score"]),
+            "n_predictions": best["n"],
+            "bench_segments": segment_count,
+            "bench_window": [
+                bench_valid[0]["start_t"].isoformat() if bench_valid else None,
+                bench_valid[-1]["end_t"].isoformat() if bench_valid else None,
+            ],
+        }
+    print(json.dumps(out, separators=(",", ":")))
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--log-dir", type=Path, default=LOG_DIR_DEFAULT)
+    p.add_argument("--algorithms",
+                   help="comma-separated; e.g. naive-5,ewma-5,blend-2-15")
+    p.add_argument("--from", dest="from_",
+                   help="YYYY-MM-DD inclusive")
+    p.add_argument("--to",
+                   help="YYYY-MM-DD inclusive")
+    p.add_argument("--segments-only", action="store_true",
+                   help="list discharge segments and exit")
+    p.add_argument("--show-predictions", type=int, metavar="SEG_INDEX",
+                   help="show predictions across the chosen segment")
+    p.add_argument("--oracle", action="store_true",
+                   help="emit one-line JSON identifying the best "
+                        "algorithm (widget-consumable)")
+    p.add_argument("--no-color", action="store_true",
+                   help="disable ANSI color")
+    p.add_argument("--ascii", action="store_true",
+                   help="ASCII chars instead of unicode blocks")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    global USE_COLOR, USE_UNICODE
+    USE_COLOR = not args.no_color and sys.stdout.isatty()
+    USE_UNICODE = not args.ascii
+
+    if not args.log_dir.is_dir():
+        print(f"log dir not found: {args.log_dir}", file=sys.stderr)
+        return 1
+
+    dt_from = (datetime.datetime.fromisoformat(args.from_)
+               if args.from_ else None)
+    dt_to = (datetime.datetime.fromisoformat(args.to)
+             if args.to else None)
+    rows = list(iter_logs(args.log_dir, dt_from, dt_to))
+    if not rows:
+        print("no log rows found", file=sys.stderr)
+        return 1
+
+    annotate_actual_end(rows)
+    segments = find_segments(rows)
+    bench_valid = [s for s in segments
+                   if s["ticks"][-1].get("_actual_end") is not None
+                   and len(s["ticks"]) >= MIN_SEGMENT_TICKS]
+    open_segs = [s for s in segments
+                 if s["ticks"][-1].get("_actual_end") is None]
+    algorithms = select_algorithms(args.algorithms)
+
+    if args.oracle:
+        # Quiet mode: skip the human report. We still need to run the
+        # bench so we can emit the right recommendation.
+        if not bench_valid:
+            emit_oracle(None, [], 0, [])
+            return 0
+        combined = defaultdict(list)
+        stability_by_algo = defaultdict(list)
+        for seg in bench_valid:
+            seg_preds = replay_segment(seg, algorithms)
+            seg_live = replay_segment_live(seg, algorithms)
+            for name, preds in seg_preds.items():
+                combined[name].extend(preds)
+            for name, series in seg_live.items():
+                stab = stability_for_segment(series)
+                if stab is not None:
+                    stability_by_algo[name].append(stab)
+        result = leaderboard_to_dict(combined, stability_by_algo)
+        emit_oracle(result["best"], result["rows"], len(bench_valid),
+                    bench_valid)
+        return 0
+
+    big_section("HEADER")
+    section("Data window")
+    kv("from",     f"{rows[0]['_t']}")
+    kv("to",       f"{rows[-1]['_t']}")
+    kv("segments",
+       f"{len(segments)} total, {len(bench_valid)} bench-valid "
+       f"(>= {MIN_SEGMENT_TICKS} ticks, real end known), "
+       f"{len(open_segs)} open / unfinished")
+    kv("algorithms",
+       f"{len(algorithms)} ({', '.join(a.name for a in algorithms)})")
+
+    if args.segments_only:
+        big_section("SEGMENTS")
+        print_segments(segments)
+        return 0
+    if args.show_predictions is not None:
+        idx = args.show_predictions
+        if idx < 0 or idx >= len(segments):
+            print(f"segment index {idx} out of range "
+                  f"(have {len(segments)} segments)", file=sys.stderr)
+            return 1
+        big_section("PREDICTION TIMELINE")
+        show_predictions(segments[idx], algorithms)
+        return 0
+
+    if not bench_valid:
+        big_section("PREVIEW")
+        section("No bench-valid discharge segments yet")
+        print("  need a plug-in (or status transition out of Discharging)")
+        print("  to know the actual end. Showing predictions on the most")
+        print("  recent open segment (sanity preview only):")
+        if segments:
+            show_predictions(segments[-1], algorithms)
+        return 0
+
+    # Backtest -- per-tick predictions for closed segments.
+    combined = defaultdict(list)
+    stability_by_algo = defaultdict(list)
+    for seg in bench_valid:
+        seg_preds = replay_segment(seg, algorithms)
+        seg_live = replay_segment_live(seg, algorithms)
+        for name, preds in seg_preds.items():
+            combined[name].extend(preds)
+        for name, series in seg_live.items():
+            stab = stability_for_segment(series)
+            if stab is not None:
+                stability_by_algo[name].append(stab)
+
+    big_section("LEADERBOARD")
+    out = leaderboard(combined, len(bench_valid), stability_by_algo)
+    if out is None:
+        return 0
+    best, top_rows = out
+
+    big_section("BREAKDOWNS")
+    horizon_table(combined, top_rows)
+    signed_horizon(combined, top_rows)
+    soc_table(combined, top_rows)
+    tier_table(combined, top_rows)
+    stability_breakdown(stability_by_algo, top_rows)
+    per_segment_table(combined, bench_valid, top_rows)
+    error_sparkline_per_algo(combined, top_rows)
+
+    big_section("ORACLE")
+    section(f"Recommended: {best['name']}")
+    kv("med abs error",
+       f"{fmt_mins_abs(best['med_abs'])}, "
+       f"p90 {fmt_mins_abs(best['p90_abs'])}",
+       value_color=OK_COLOR)
+    kv("signed bias",
+       f"{fmt_mins(best['mean_err'])} "
+       f"({best['bias_up_pct']:.0f}% predictions overshoot)")
+    if not math.isnan(best["stability"]):
+        delta = "Δ" if USE_UNICODE else "d/"
+        kv("stability",
+           f"median |{delta}predict| {best['stability']/60:.1f} min per tick")
+    kv("score",
+       f"{best['score']/60:.2f} min  (med_abs + stability + 0.5*|bias|)")
+    print()
+    print("  machine-readable JSON for widget consumption:")
+    print(C("    powertux-eta-bench --oracle", INFO_COLOR))
+    return 0
+
+
+def leaderboard_to_dict(combined, stability_by_algo):
+    """Pure-data variant of the leaderboard for --oracle mode."""
+    rows = []
+    for name, preds in combined.items():
+        if not preds:
+            continue
+        errs = [p - a for p, a, *_ in preds]
+        abs_errs = [abs(e) for e in errs]
+        n = len(errs)
+        med_abs = pct(abs_errs, 50)
+        p90_abs = pct(abs_errs, 90)
+        mean_err = sum(errs) / n if n else 0
+        stab_vals = stability_by_algo.get(name, [])
+        stability = (statistics.median(stab_vals)
+                     if stab_vals else float("nan"))
+        score = (med_abs
+                 + (stability if not math.isnan(stability) else 0)
+                 + 0.5 * abs(mean_err))
+        rows.append({
+            "name": name,
+            "n": n,
+            "med_abs": med_abs,
+            "p90_abs": p90_abs,
+            "mean_err": mean_err,
+            "stability": stability,
+            "score": score,
+            "bias_up_pct": sum(1 for e in errs if e > 0) * 100.0 / n,
+        })
+    rows.sort(key=lambda r: r["score"])
+    return {"best": rows[0] if rows else None, "rows": rows}
+
+
+if __name__ == "__main__":
+    sys.exit(main())

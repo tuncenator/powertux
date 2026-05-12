@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""powertux-probe: probe each level under sustained load. Use to discover
+whether any level sandbags the CPU on battery (or any other axis).
+
+For each level 1-4:
+- Apply via powertux-set
+- Settle 10s
+- Run `7z b 5` (~50s of CPU-bound load)
+- Sample freq + RAPL + BAT0 power_now every 1s for 30s
+- 15s recovery
+
+Outputs per-level: median/min/max MHz, %samples below 2 GHz, RAPL pkg W,
+BAT0 power_now mean, peak temp.
+
+Pins autod (mode=pinned) for the duration; restores prior state on exit.
+"""
+import datetime
+import glob
+import json
+import os
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+LEVELS = [1, 2, 3, 4]
+SETTLE_SEC = 10
+LOAD_SEC = 30
+RECOVER_SEC = 15
+
+RESULTS_DIR = Path.home() / "Programs" / "powertux" / "results"
+STATE_FILE = Path.home() / ".config" / "powertux" / "state.json"
+FREQ_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+
+
+def find_rapl():
+    for d in sorted(Path("/sys/class/powercap").glob("intel-rapl:*")):
+        try:
+            if (d / "name").read_text().strip().startswith("package"):
+                return d / "energy_uj"
+        except OSError:
+            continue
+    return None
+
+
+def find_temp():
+    for h in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        try:
+            if (h / "name").read_text().strip() == "k10temp":
+                return h / "temp1_input"
+        except OSError:
+            continue
+    return None
+
+
+def cpu_freqs_mhz():
+    out = []
+    for f in glob.glob(FREQ_GLOB):
+        try:
+            out.append(int(Path(f).read_text()) / 1000.0)
+        except OSError:
+            pass
+    return out
+
+
+def read_int(p, default=None):
+    try:
+        return int(Path(p).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def sample_window(seconds, rapl_path, temp_path):
+    freq_samples = []
+    temp_samples = []
+    bat_w_samples = []
+    e0 = read_int(rapl_path)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < seconds:
+        fs = cpu_freqs_mhz()
+        if fs:
+            freq_samples.append(fs)
+        t = read_int(temp_path)
+        if t is not None:
+            temp_samples.append(t / 1000.0)
+        bp = read_int("/sys/class/power_supply/BAT0/power_now")
+        if bp and bp > 0:
+            bat_w_samples.append(bp / 1_000_000.0)
+        time.sleep(1)
+    elapsed = time.monotonic() - t0
+    e1 = read_int(rapl_path)
+    pkg_w = (e1 - e0) / 1_000_000.0 / elapsed if (e0 is not None and e1 is not None) else None
+    all_freqs = [f for snap in freq_samples for f in snap]
+    return {
+        "elapsed_s": round(elapsed, 1),
+        "pkg_w": round(pkg_w, 2) if pkg_w is not None else None,
+        "bat_w_mean": round(statistics.mean(bat_w_samples), 2) if bat_w_samples else None,
+        "freq_median_mhz": round(statistics.median(all_freqs)) if all_freqs else None,
+        "freq_mean_mhz": round(statistics.mean(all_freqs)) if all_freqs else None,
+        "freq_min_mhz": round(min(all_freqs)) if all_freqs else None,
+        "freq_max_mhz": round(max(all_freqs)) if all_freqs else None,
+        "pct_below_2ghz": round(100 * sum(1 for f in all_freqs if f < 2000) / len(all_freqs), 1) if all_freqs else None,
+        "temp_c_max": round(max(temp_samples), 1) if temp_samples else None,
+        "temp_c_mean": round(statistics.mean(temp_samples), 1) if temp_samples else None,
+        "ticks": len(freq_samples),
+    }
+
+
+def main():
+    if os.geteuid() != 0:
+        print("must run as root: sudo powertux-probe", file=sys.stderr)
+        sys.exit(1)
+
+    rapl = find_rapl()
+    temp = find_temp()
+    if rapl is None or temp is None:
+        print("RAPL or k10temp not found", file=sys.stderr)
+        sys.exit(1)
+
+    ac_online = read_int("/sys/class/power_supply/AC0/online", -1)
+    cap_start = read_int("/sys/class/power_supply/BAT0/capacity", -1)
+    print(f"powertux-probe; AC={ac_online} battery={cap_start}%")
+    if ac_online == 1:
+        print("NOTE: on AC. Battery-mode behaviors won't reproduce here.", file=sys.stderr)
+
+    orig_state = None
+    if STATE_FILE.exists():
+        try:
+            orig_state = STATE_FILE.read_text()
+        except OSError:
+            pass
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"mode": "pinned"}))
+    print("autod mode -> pinned for duration\n")
+
+    def restore():
+        try:
+            if orig_state:
+                STATE_FILE.write_text(orig_state)
+            else:
+                STATE_FILE.write_text(json.dumps({"mode": "auto"}))
+        except OSError:
+            pass
+
+    def on_signal(*_):
+        print("\nsignal received; restoring and exiting")
+        restore()
+        sys.exit(130)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    results = []
+    try:
+        for i, lvl in enumerate(LEVELS, 1):
+            print(f"[{i}/{len(LEVELS)}] L{lvl}")
+            subprocess.run(["/usr/local/sbin/powertux-set", str(lvl)], check=True)
+            print(f"  applied; settle {SETTLE_SEC}s")
+            time.sleep(SETTLE_SEC)
+
+            epp = Path("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference").read_text().strip()
+            boost = Path("/sys/devices/system/cpu/cpufreq/boost").read_text().strip()
+            pp = Path("/sys/firmware/acpi/platform_profile").read_text().strip()
+            print(f"  kernel: pp={pp} epp={epp} boost={boost}")
+
+            print(f"  loading + sampling for {LOAD_SEC}s")
+            proc = subprocess.Popen(["7z", "b", "5"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stats = sample_window(LOAD_SEC, rapl, temp)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+            print(
+                f"  pkg={stats['pkg_w']}W bat={stats['bat_w_mean']}W "
+                f"med={stats['freq_median_mhz']} min={stats['freq_min_mhz']} "
+                f"max={stats['freq_max_mhz']} %<2G={stats['pct_below_2ghz']}% "
+                f"temp_max={stats['temp_c_max']}"
+            )
+
+            results.append({
+                "level": lvl,
+                "kernel": {"pp": pp, "epp": epp, "boost": boost},
+                "stats": stats,
+            })
+
+            print(f"  recovery {RECOVER_SEC}s\n")
+            time.sleep(RECOVER_SEC)
+    finally:
+        restore()
+        print("autod state restored")
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    out_file = RESULTS_DIR / f"{ts}-probe-{'bat' if ac_online == 0 else 'ac'}.json"
+    out_file.write_text(json.dumps({
+        "timestamp": ts,
+        "ac_online": ac_online,
+        "cap_start_pct": cap_start,
+        "cap_end_pct": read_int("/sys/class/power_supply/BAT0/capacity", -1),
+        "results": results,
+    }, indent=2))
+    print(f"\nresults: {out_file}\n")
+
+    # Table
+    print(f"{'L':<3} {'pkg_W':>7} {'bat_W':>7} {'med_MHz':>9} {'min_MHz':>9} {'max_MHz':>9} {'%<2G':>7} {'temp_max':>9}")
+    print("-" * 67)
+    for r in results:
+        s = r["stats"]
+        def f(v): return "?" if v is None else str(v)
+        print(
+            f"{r['level']:<3} {f(s['pkg_w']):>7} {f(s['bat_w_mean']):>7} "
+            f"{f(s['freq_median_mhz']):>9} {f(s['freq_min_mhz']):>9} "
+            f"{f(s['freq_max_mhz']):>9} {f(s['pct_below_2ghz']):>7} {f(s['temp_c_max']):>9}"
+        )
+
+
+if __name__ == "__main__":
+    main()

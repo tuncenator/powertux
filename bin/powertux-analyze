@@ -1,0 +1,2224 @@
+#!/usr/bin/env python3
+"""powertux-analyze: deep terminal report on autod JSONL logs.
+
+Reads ~/Programs/powertux/log/*.jsonl{,.gz} (override with --log-dir) and
+prints one continuous report. Stdlib only; renders at 80 cols with
+unicode block elements (--ascii falls back to printable ASCII; --no-color
+disables ANSI when piping).
+
+The report leads with an executive summary and a tuning-recommendations
+block. The intent: a single glance answers "what should I tune?", a
+two-minute read answers "what changed?", and the full report carries
+enough cross-cuts that anomalies caught a week from now still have the
+evidence right next to them.
+
+Sections (in order):
+
+  HEADER
+    - hardware/kernel identity from autod startup records
+    - range, coverage, gaps, AC/battery split, mode split, edge counts
+
+  HIGHLIGHTS
+    - TL;DR: the 5-8 numbers that matter most this window
+    - Tuning recommendations: actionable suggestions with reasoning
+        (chatter mitigation, L1 reach, threshold band sensitivity,
+        decision-table cell divergence)
+
+  USAGE / TIER BEHAVIOR
+    - Tier residency: overall + AC + battery stacked bars
+    - Tier ribbon: per-day dense tier strip (192 cells/day = 7.5 min/cell)
+    - Daily timeline: per-day 24h strip, load + tier dominant per hour
+    - Hour-of-day pattern (only with >=2 days of data)
+    - Tier transitions per hour with up/down split
+    - Tier pair transition matrix (which tier <-> which tier flips most)
+    - Chatter analysis: rate, dominant pair, hour, load band
+    - Decision-table validation with what-if at adjacent thresholds
+    - Threshold sensitivity: % of time near each boundary
+
+  LOAD / POWER
+    - load1m distribution + p50/p95/p99/max, with load5m / load15m
+    - Power efficiency timeline: W and SoC over time
+    - vs baseline: observed Wh vs counterfactual at vendor defaults
+    - Per-display power attribution: avg w_sys by displays set
+        (the Arzopa / bus-powered display story)
+
+  BATTERY
+    - Battery sessions: per-session table with drain rate
+    - Pending-tier outcome (hold-timer effectiveness)
+    - Battery voltage / SoC: OCV-SoC vs kernel cap, drift events
+    - Battery gauge / wear (EC truth, raw_xif1 / raw_xif2 / raw_cycles)
+
+  PLATFORM
+    - Platform drift: pp/epp/boost/tccd vs expected for current tier
+    - Thermal: per-tier CPU/GPU p50/max + idle vs load split
+    - Calibration health: chatter, latency, pending durations, overrides
+    - Environment context: brightness, displays, lid, charging_profile
+
+  EVENTS
+    - Highlights reel: longest pending, biggest drift, AC edges, etc.
+
+Run with --section to limit to one section (or comma-separated subset).
+"""
+import argparse
+import datetime
+import gzip
+import json
+import math
+import shutil
+import statistics
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+# -----------------------------------------------------------------------------
+# Constants the report leans on. Values stay in sync with autod's own knobs;
+# changing them here doesn't change behavior, only the way we describe it.
+# -----------------------------------------------------------------------------
+
+TICK = 5
+UPGRADE_HOLD_SEC = 5
+DOWNGRADE_HOLD_SEC = 30
+CHATTER_WINDOW_SEC = 300
+
+# Tunable "target" thresholds for the recommendations engine. These come
+# from devlog notes; nothing else in the codebase reads them.
+TARGET_CHATTER_PCT = 25.0           # over this -> recommend longer hold / hysteresis
+TARGET_MIN_L1_RESIDENCY_PCT = 1.0   # below this on battery -> L1 isn't reaching
+TARGET_DRIFT_DAYS = 7               # voltage / cap_th drift checks span this many days
+
+# CPU package W per powertux tier, from results/*.json calibrations.
+# Source profiles: L1=S-lp-BP-b0 (boost=0), L2=ODM-pwsv-perf-BP,
+# L3=ODM-enth-perf-BP, L4=ODM-ovrb-perf-pf. RAPL package energy_uj over
+# 10-15s idle and 40s `7z b 2` segments.
+TIER_W = {
+    1: (4.53, 18.43),
+    2: (5.32, 24.96),
+    3: (5.32, 40.82),
+    4: (9.44, 64.26),
+}
+# Vendor defaults that powertux replaces.
+BASELINE_AC = (5.67, 46.87)   # TUXEDO Defaults: ODM-none, perf pp, BP EPP
+BASELINE_BAT = (4.92, 44.07)  # Battery Efficient: low-power pp, power EPP
+
+LOAD_FULL = 2.0  # load1m at which calibration "load" segment saturates
+
+EXPECTED_PP_EPP_BOOST = {
+    1: ("low-power", "power", 0),
+    2: ("performance", "balance_performance", 1),
+    3: ("performance", "balance_performance", 1),
+    4: ("performance", "performance", 1),
+}
+TIER_TCCD_ID = {
+    1: "powertux-silent",
+    2: "powertux-quiet",
+    3: "powertux-balanced",
+    4: "powertux-perf",
+}
+
+# Generic Li-ion OCV -> SoC curve, per cell. Linear-interpolated between
+# anchors. Conservative; real curves vary by chemistry (NMC vs LFP vs LCO)
+# but this captures the inflection points well enough for monitoring.
+OCV_SOC = [
+    (4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85),
+    (4.00, 80), (3.95, 75), (3.90, 70), (3.85, 60),
+    (3.80, 50), (3.75, 40), (3.70, 30), (3.65, 25),
+    (3.60, 20), (3.55, 15), (3.50, 10), (3.45, 5),
+    (3.40, 0),
+]
+
+# 256-color foreground codes (bright variants).
+TIER_COLOR = {1: 10, 2: 14, 3: 11, 4: 9}   # green / cyan / yellow / red
+WARN_COLOR = 208   # orange
+CRIT_COLOR = 196   # bright red
+OK_COLOR = 46      # bright green
+DIM_COLOR = 245
+INFO_COLOR = 39    # azure
+TIER_NAME = {1: "L1 silent", 2: "L2 quiet", 3: "L3 balanced", 4: "L4 perf"}
+TIER_SHORT = {1: "L1", 2: "L2", 3: "L3", 4: "L4"}
+
+BLOCK_FRAC = " ▏▎▍▌▋▊▉█"
+SPARK = " ▁▂▃▄▅▆▇█"
+SPARK_ASCII = " .:-=+*#@"
+HEAVY_SPARK = "▁▂▃▄▅▆▇█"  # no space, always at least a tick visible
+
+USE_COLOR = True
+USE_UNICODE = True
+
+
+def get_terminal_width(default=80):
+    """Terminal width when stdout is a tty, otherwise a reasonable
+    default. Used to scale the variable-density ribbon section."""
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except OSError:
+        return default
+
+
+# -----------------------------------------------------------------------------
+# Formatting primitives
+# -----------------------------------------------------------------------------
+
+def C(text, n, *, bold=False):
+    if not USE_COLOR:
+        return text
+    if n is None:
+        return f"\x1b[1m{text}\x1b[0m" if bold else text
+    prefix = f"\x1b[1;38;5;{n}m" if bold else f"\x1b[38;5;{n}m"
+    return f"{prefix}{text}\x1b[0m"
+
+
+def bar(value, max_val, width):
+    """Render value/max_val as a width-wide bar with 1/8-cell precision."""
+    if max_val <= 0 or value <= 0:
+        return " " * width
+    if not USE_UNICODE:
+        n = max(0, min(width, round(value / max_val * width)))
+        return "#" * n + " " * (width - n)
+    cells = min(1.0, value / max_val) * width
+    full = int(cells)
+    frac = int((cells - full) * 8)
+    out = "█" * full
+    if frac > 0 and full < width:
+        out += BLOCK_FRAC[frac]
+        full += 1
+    return out + " " * (width - full)
+
+
+def spark(value, max_val):
+    chars = SPARK if USE_UNICODE else SPARK_ASCII
+    if max_val <= 0:
+        return chars[0]
+    i = max(0, min(8, int(round(value / max_val * 8))))
+    return chars[i]
+
+
+def fmt_dur(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s" if s else f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m" if m else f"{h}h"
+    d, h = divmod(h, 24)
+    return f"{d}d{h:02d}h" if h else f"{d}d"
+
+
+def fmt_pct(x, digits=1):
+    return f"{x * 100:5.{digits}f}%"
+
+
+def big_section(title):
+    """Header used for the top-level dividers. The full-width rule makes
+    the section breaks obvious when the report is long, which it is."""
+    print()
+    print(C("═" * 78 if USE_UNICODE else "=" * 78, INFO_COLOR))
+    print(C(title.upper(), INFO_COLOR, bold=True))
+    print(C("═" * 78 if USE_UNICODE else "=" * 78, INFO_COLOR))
+
+
+def section(title):
+    print()
+    print(C(title, None, bold=True))
+    print("─" * 64 if USE_UNICODE else "-" * 64)
+
+
+def kv(label, value, width=24, value_color=None):
+    """Compact label/value line. Used by header + recommendations + TL;DR
+    so they share visual structure: label left, value right, no decoration."""
+    lbl = f"  {label:<{width}}"
+    if value_color is not None:
+        value = C(value, value_color)
+    print(f"{lbl}{value}")
+
+
+def bullet(level, text):
+    """Indented bullet. level=0 -> '>', level=1 -> '  -'. Used in the
+    recommendations section to nest reason / effect under each rec."""
+    if level == 0:
+        prefix = "> "
+    else:
+        prefix = "  " * level + "- "
+    print(f"  {prefix}{text}")
+
+
+def percentile(xs, p):
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    k = max(0, min(len(xs) - 1, int(round(p / 100.0 * (len(xs) - 1)))))
+    return xs[k]
+
+
+def detect_cells(v_bat):
+    for n in (4, 3, 2, 1):
+        per_cell = v_bat / n
+        if 3.0 <= per_cell <= 4.3:
+            return n
+    return 4
+
+
+def ocv_soc(v_cell):
+    if v_cell >= OCV_SOC[0][0]:
+        return 100.0
+    if v_cell <= OCV_SOC[-1][0]:
+        return 0.0
+    for (v_hi, s_hi), (v_lo, s_lo) in zip(OCV_SOC, OCV_SOC[1:]):
+        if v_lo <= v_cell <= v_hi:
+            frac = (v_cell - v_lo) / (v_hi - v_lo)
+            return s_lo + (s_hi - s_lo) * frac
+    return 0.0
+
+
+def w_at(idle_w, load_w, load1m):
+    if load1m <= 0:
+        return idle_w
+    frac = min(1.0, load1m / LOAD_FULL)
+    return idle_w + (load_w - idle_w) * frac
+
+
+def policy_cell(r):
+    load = r.get("load1m", 0) or 0
+    cap = r.get("cap", 0) or 0
+    if load < 2:
+        load_b = 0
+    elif load < 8:
+        load_b = 1
+    else:
+        load_b = 2
+    if r.get("ac") == 1:
+        cap_b = "AC"
+    elif cap >= 60:
+        cap_b = "B+"
+    elif cap >= 30:
+        cap_b = "B="
+    else:
+        cap_b = "B-"
+    return cap_b, load_b
+
+
+EXPECTED = {
+    ("AC", 0): 2, ("AC", 1): 3, ("AC", 2): 4,
+    ("B+", 0): 1, ("B+", 1): 2, ("B+", 2): 3,
+    ("B=", 0): 1, ("B=", 1): 2, ("B=", 2): 2,
+    ("B-", 0): 1, ("B-", 1): 1, ("B-", 2): 2,
+}
+
+
+# -----------------------------------------------------------------------------
+# Log loading
+# -----------------------------------------------------------------------------
+
+def iter_logs(log_dir, dt_from, dt_to):
+    paths_by_stem = {}
+    for p in Path(log_dir).iterdir():
+        name = p.name
+        if name.endswith(".jsonl.gz"):
+            stem = name[:-9]
+        elif name.endswith(".jsonl"):
+            stem = name[:-6]
+        else:
+            continue
+        prev = paths_by_stem.get(stem)
+        if prev is not None and prev.name.endswith(".jsonl"):
+            continue
+        paths_by_stem[stem] = p
+    for stem in sorted(paths_by_stem):
+        p = paths_by_stem[stem]
+        try:
+            d = datetime.date.fromisoformat(stem)
+        except ValueError:
+            continue
+        if dt_from and d < dt_from.date():
+            continue
+        if dt_to and d > dt_to.date():
+            continue
+        opener = gzip.open if p.name.endswith(".gz") else open
+        with opener(p, "rt") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    row["_t"] = datetime.datetime.fromisoformat(row["t"])
+                except Exception:
+                    continue
+                if dt_from and row["_t"] < dt_from:
+                    continue
+                if dt_to and row["_t"] >= dt_to:
+                    continue
+                yield row
+
+
+def load_rows(args):
+    dt_from = dt_to = None
+    if args.days:
+        dt_to = datetime.datetime.now()
+        dt_from = dt_to - datetime.timedelta(days=args.days)
+    if args.from_:
+        dt_from = datetime.datetime.fromisoformat(args.from_)
+    if args.to:
+        dt_to = datetime.datetime.fromisoformat(args.to)
+    rows = list(iter_logs(args.log_dir, dt_from, dt_to))
+    meta_rows = [r for r in rows if r.get("meta")]
+    tick_rows = [r for r in rows if not r.get("meta")]
+    tick_rows.sort(key=lambda r: r["_t"])
+    meta_rows.sort(key=lambda r: r["_t"])
+    return tick_rows, meta_rows
+
+
+# -----------------------------------------------------------------------------
+# Cross-section state. We compute a `Summary` once over all rows and pass it
+# to every section, so TL;DR / recommendations can reference the same numbers
+# that later detail sections render.
+# -----------------------------------------------------------------------------
+
+class Summary:
+    """Aggregate stats computed once. Every section reads from this rather
+    than rescanning rows, which keeps the report fast on multi-week logs and
+    -- more importantly -- keeps the TL;DR / detail numbers in sync."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.span = (rows[-1]["_t"] - rows[0]["_t"]).total_seconds() + TICK
+        self.n = len(rows)
+        self.t0 = rows[0]["_t"]
+        self.t1 = rows[-1]["_t"]
+        self.days = sorted({r["_t"].date() for r in rows})
+
+        self.ac = sum(1 for r in rows if r.get("ac") == 1) * TICK
+        self.bat = sum(1 for r in rows if r.get("ac") == 0) * TICK
+        self.auto = sum(1 for r in rows if r.get("mode") == "auto") * TICK
+        self.pinned = sum(1 for r in rows if r.get("mode") == "pinned") * TICK
+
+        self.tier_total = Counter()
+        self.tier_ac = Counter()
+        self.tier_bat = Counter()
+        self.tier_auto = Counter()
+        for r in rows:
+            lv = r.get("current")
+            if lv in (1, 2, 3, 4):
+                self.tier_total[lv] += TICK
+                if r.get("ac") == 1:
+                    self.tier_ac[lv] += TICK
+                elif r.get("ac") == 0:
+                    self.tier_bat[lv] += TICK
+                if r.get("mode") == "auto":
+                    self.tier_auto[lv] += TICK
+
+        self.gap_secs = 0
+        for a, b in zip(rows, rows[1:]):
+            dt = (b["_t"] - a["_t"]).total_seconds()
+            if dt > TICK * 2:
+                self.gap_secs += dt - TICK
+        self.coverage = (self.n * TICK) / self.span if self.span > 0 else 0
+
+        # Transitions (auto-mode only, since pinned never auto-transitions).
+        self.transitions = []  # (t, from, to)
+        prev = None
+        for r in rows:
+            if r.get("mode") != "auto":
+                prev = None
+                continue
+            cur = r.get("current")
+            if cur in (1, 2, 3, 4):
+                if prev is not None and cur != prev:
+                    self.transitions.append((r["_t"], prev, cur))
+                prev = cur
+
+        self.chatter = 0
+        for i, (t, p, _) in enumerate(self.transitions):
+            for j in range(i + 1, len(self.transitions)):
+                t2, _, n2 = self.transitions[j]
+                if (t2 - t).total_seconds() > CHATTER_WINDOW_SEC:
+                    break
+                if n2 == p:
+                    self.chatter += 1
+                    break
+        self.chatter_pct = (self.chatter * 100.0 / len(self.transitions)
+                            if self.transitions else 0)
+
+        loads = sorted((r.get("load1m") or 0) for r in rows)
+        self.load_p50 = loads[len(loads) // 2] if loads else 0
+        self.load_p95 = loads[int(len(loads) * 0.95)] if loads else 0
+
+        # Threshold-band residency: load1m close to a decision boundary
+        # is the structural reason for chatter, so we surface it.
+        self.near_l2_l3 = sum(
+            1 for r in rows if 1.5 <= (r.get("load1m") or 0) <= 2.5
+        ) * TICK
+
+        # Battery sessions (used by TL;DR + battery section).
+        self.sessions = []
+        cur = []
+        for r in rows:
+            if r.get("ac") == 0:
+                if cur and (r["_t"] - cur[-1]["_t"]).total_seconds() > 30:
+                    self.sessions.append(cur)
+                    cur = []
+                cur.append(r)
+            else:
+                if cur:
+                    self.sessions.append(cur)
+                    cur = []
+        if cur:
+            self.sessions.append(cur)
+
+        self.drain_pct = 0.0
+        self.drain_secs = 0
+        for s in self.sessions:
+            if len(s) < 2:
+                continue
+            c0, c1 = s[0].get("cap"), s[-1].get("cap")
+            if c0 is None or c1 is None:
+                continue
+            secs = (s[-1]["_t"] - s[0]["_t"]).total_seconds()
+            if secs > 0 and c0 > c1:
+                self.drain_pct += c0 - c1
+                self.drain_secs += secs
+        self.drain_rate = (self.drain_pct / self.drain_secs * 3600
+                           if self.drain_secs > 0 else 0)
+
+        # Observed vs baseline Wh for the savings number.
+        obs_j = cf_j = 0.0
+        for r in rows:
+            cur = r.get("current")
+            if cur not in (1, 2, 3, 4):
+                continue
+            load = r.get("load1m") or 0
+            ac = r.get("ac") == 1
+            obs_w = r.get("w_pkg")
+            if obs_w is None:
+                idle_w, load_w = TIER_W[cur]
+                obs_w = w_at(idle_w, load_w, load)
+            b_idle, b_load = BASELINE_AC if ac else BASELINE_BAT
+            obs_j += obs_w * TICK
+            cf_j += w_at(b_idle, b_load, load) * TICK
+        self.obs_wh = obs_j / 3600.0
+        self.cf_wh = cf_j / 3600.0
+
+        # Cap-vs-cells drift: max OCV-SoC above cap_th, in any tick.
+        self.cap_drift_max = 0.0
+        self.cap_drift_at = None
+        for r in rows:
+            v_bat = r.get("v_bat")
+            cth = r.get("cap_th")
+            if v_bat is None or cth is None or cth >= 100 or cth <= 0:
+                continue
+            cells = detect_cells(v_bat)
+            soc = ocv_soc(v_bat / cells)
+            d = soc - cth
+            if d > self.cap_drift_max:
+                self.cap_drift_max = d
+                self.cap_drift_at = r["_t"]
+
+        # Pending hold-timer outcome.
+        self.pend_applied = 0
+        self.pend_reverted = 0
+        in_pending = False
+        target = None
+        for r in rows:
+            p = r.get("pending")
+            c = r.get("current")
+            if p is not None:
+                if not in_pending:
+                    in_pending = True
+                    target = p
+                elif p != target:
+                    self.pend_reverted += 1
+                    target = p
+            else:
+                if in_pending:
+                    if c == target:
+                        self.pend_applied += 1
+                    else:
+                        self.pend_reverted += 1
+                    in_pending = False
+                    target = None
+
+
+# -----------------------------------------------------------------------------
+# Sections
+# -----------------------------------------------------------------------------
+
+def section_metadata(meta_rows):
+    if not meta_rows:
+        return
+    section("Hardware / kernel")
+    latest = meta_rows[-1]
+    fields = [
+        ("host", "host"),
+        ("kernel", "kernel"),
+        ("cpu_model", "cpu"),
+        ("dmi_product_name", "board"),
+        ("dmi_board_name", "board id"),
+        ("dmi_bios_version", "bios"),
+        ("battery_model", "battery model"),
+        ("charge_full_design", "charge_full_design (uAh)"),
+        ("voltage_min_design", "voltage_min_design (uV)"),
+    ]
+    for key, label in fields:
+        if key in latest:
+            kv(label, str(latest[key]), width=26)
+    if len(meta_rows) > 1:
+        kv("daemon starts in window", str(len(meta_rows)), width=26)
+        for r in meta_rows[-3:]:
+            print(f"    {r['_t']}")
+
+
+def section_header(s):
+    section("Range")
+    kv("from", f"{s.t0:%Y-%m-%d %H:%M:%S}")
+    kv("to", f"{s.t1:%Y-%m-%d %H:%M:%S}")
+    kv("span", fmt_dur(s.span))
+    kv("samples",
+       f"{s.n}  ({fmt_dur(s.n * TICK)}, coverage {fmt_pct(s.coverage)})")
+    if s.gap_secs > 0:
+        kv("gaps", fmt_dur(s.gap_secs),
+           value_color=WARN_COLOR if s.gap_secs > 3600 else None)
+    tot = s.ac + s.bat or 1
+    kv("on AC", f"{fmt_dur(s.ac):>10s}  {fmt_pct(s.ac / tot)}")
+    kv("on battery", f"{fmt_dur(s.bat):>10s}  {fmt_pct(s.bat / tot)}")
+    edges_plug = edges_unplug = 0
+    last = None
+    for r in s.rows:
+        a = r.get("ac")
+        if last is not None and a != last:
+            if a == 1:
+                edges_plug += 1
+            else:
+                edges_unplug += 1
+        last = a
+    kv("AC edges", f"{edges_plug} plug-in, {edges_unplug} unplug")
+    tot = s.auto + s.pinned or 1
+    kv("mode auto",   f"{fmt_dur(s.auto):>10s}  {fmt_pct(s.auto / tot)}")
+    kv("mode pinned", f"{fmt_dur(s.pinned):>10s}  {fmt_pct(s.pinned / tot)}")
+
+
+def section_tldr(s):
+    section("TL;DR")
+    # Tier residency on battery -- the L3-on-battery story is the headline
+    # when battery sessions exist.
+    tot_bat = sum(s.tier_bat.values()) or 1
+    bat_share = [(lv, s.tier_bat.get(lv, 0) / tot_bat) for lv in (1, 2, 3, 4)]
+    bat_share = sorted(bat_share, key=lambda x: -x[1])
+    if s.bat:
+        dom_lv, dom_share = bat_share[0]
+        l1_share = s.tier_bat.get(1, 0) / tot_bat
+        bullet(0,
+               f"battery: dominant tier {C(TIER_SHORT[dom_lv], TIER_COLOR[dom_lv])}"
+               f" ({fmt_pct(dom_share)}), L1 {fmt_pct(l1_share)}")
+    if s.transitions:
+        verdict = (CRIT_COLOR if s.chatter_pct > 50
+                   else WARN_COLOR if s.chatter_pct > TARGET_CHATTER_PCT
+                   else OK_COLOR)
+        rate = len(s.transitions) / max(1, s.auto / 3600)
+        bullet(0,
+               f"chatter: {C(f'{s.chatter_pct:.1f}%', verdict)} of "
+               f"{len(s.transitions)} transitions reverted within "
+               f"{CHATTER_WINDOW_SEC // 60}min "
+               f"(target <{TARGET_CHATTER_PCT:.0f}%, rate {rate:.1f}/hr)")
+    if s.cf_wh > 0:
+        saved_wh = s.cf_wh - s.obs_wh
+        saved_pct = saved_wh / s.cf_wh * 100
+        verb = "saved" if saved_wh >= 0 else "spent extra"
+        clr = OK_COLOR if saved_wh >= 0 else CRIT_COLOR
+        bullet(0,
+               f"vs vendor defaults: "
+               f"{C(f'{verb} {abs(saved_wh):.1f} Wh ({abs(saved_pct):.1f}%)', clr)}"
+               f" -- CPU package only, "
+               f"obs {s.obs_wh:.1f} Wh vs {s.cf_wh:.1f} Wh baseline")
+    if s.bat > 0:
+        bullet(0,
+               f"battery drain: {s.drain_rate:.1f}%/hr over "
+               f"{fmt_dur(s.drain_secs)} of net-drain sessions")
+    if s.cap_drift_max > 0:
+        clr = (CRIT_COLOR if s.cap_drift_max > 15
+               else WARN_COLOR if s.cap_drift_max > 5
+               else None)
+        when = s.cap_drift_at.strftime("%H:%M") if s.cap_drift_at else "?"
+        bullet(0,
+               f"cap-vs-cells drift: peak "
+               f"{C(f'+{s.cap_drift_max:.1f}%', clr)} OCV-SoC above cap_th "
+               f"at {when} (cap hold leaked to plateau voltage)")
+    if s.pend_applied + s.pend_reverted > 0:
+        tot = s.pend_applied + s.pend_reverted
+        bullet(0,
+               f"hold-timer outcome: {s.pend_applied} applied, "
+               f"{s.pend_reverted} reverted "
+               f"({fmt_pct(s.pend_reverted / tot)} suppressed transients)")
+    bullet(0,
+           f"load1m sits in [1.5, 2.5] {fmt_pct(s.near_l2_l3 / s.span)} of "
+           f"the window -- right at the L2/L3 boundary")
+
+
+def section_recommendations(s):
+    section("Tuning recommendations")
+    recs = []
+
+    # Chatter -> upgrade-hold tune. Recommend a hold value proportional to
+    # the chatter rate.
+    if s.transitions and s.chatter_pct > TARGET_CHATTER_PCT:
+        # Estimate suggested hold: each 5s tick of hold removes ~the
+        # fraction of chatter that occurs inside that window. Heuristic
+        # only; full sweep belongs in a separate tool.
+        suggested = min(30, max(10, int(round(s.chatter_pct / 5)) * 5))
+        recs.append((
+            CRIT_COLOR if s.chatter_pct > 50 else WARN_COLOR,
+            f"raise UPGRADE_HOLD_SEC from {UPGRADE_HOLD_SEC}s "
+            f"to ~{suggested}s",
+            [
+                f"reason: {s.chatter_pct:.1f}% of transitions reverted "
+                f"within {CHATTER_WINDOW_SEC // 60}min; "
+                f"load1m spends {fmt_pct(s.near_l2_l3 / s.span)} of time in "
+                f"the L2/L3 boundary band [1.5, 2.5].",
+                "effect: longer hold filters more in-band oscillation. "
+                "Trade-off: slower response to genuine load bursts.",
+                "alt: add a hysteresis band (different up vs down thresholds) "
+                "or switch L2/L3 decision to load5m (smoother around boundary).",
+            ],
+        ))
+
+    # L1 reach. If L1 residency is near zero on battery, the threshold
+    # ("all 3 windows < 1") is unreachable in normal use.
+    tot_bat = sum(s.tier_bat.values())
+    if tot_bat > 0:
+        l1_share = s.tier_bat.get(1, 0) / tot_bat
+        if l1_share * 100 < TARGET_MIN_L1_RESIDENCY_PCT:
+            recs.append((
+                WARN_COLOR,
+                f"L1 isn't reaching on battery "
+                f"(residency {fmt_pct(l1_share)})",
+                [
+                    "reason: sustained-idle threshold (load1m, load5m, "
+                    "load15m all < 1) is rarely satisfied with a browser "
+                    "or terminal open. L1 currently fires for"
+                    f" {fmt_dur(s.tier_bat.get(1, 0))} of "
+                    f"{fmt_dur(tot_bat)} on battery.",
+                    "effect: tiered savings on battery come almost entirely "
+                    "from L2 vs Battery Efficient (small delta). L1's "
+                    "boost-off rail (~19W load) goes unused.",
+                    "options: lower the L1 threshold to load1m<0.5 alone, "
+                    "or add an explicit screen-DPMS-off / lid-closed "
+                    "trigger for L1.",
+                ],
+            ))
+
+    # Cap-vs-cells: if drift > 5%, the user's longevity expectation is wrong.
+    if s.cap_drift_max > 5:
+        recs.append((
+            CRIT_COLOR if s.cap_drift_max > 15 else WARN_COLOR,
+            f"charge cap doesn't keep cells off plateau "
+            f"(+{s.cap_drift_max:.1f}% OCV-SoC over cap_th)",
+            [
+                "reason: charge_control_end_threshold stops the visible "
+                "charging current; the EC continues a sub-sensor maintenance "
+                "current that lifts cells to ~4.16 V/cell over hours.",
+                "effect: longevity benefit of cap=80 is much smaller than "
+                "advertised. Cells spend hours on the high-voltage plateau "
+                "anyway.",
+                "options: drop cap_th to 60-65 and re-check voltage; if cells "
+                "still drift, the EC behavior is intrinsic and the cap can't "
+                "rescue this board's longevity at all.",
+            ],
+        ))
+
+    # Pending revert ratio sanity. >50% revert means the hold is too long
+    # OR thresholds are noisy. <10% means the hold is doing very little.
+    pend_tot = s.pend_applied + s.pend_reverted
+    if pend_tot > 20:
+        rev_rate = s.pend_reverted / pend_tot
+        if rev_rate > 0.5:
+            recs.append((
+                WARN_COLOR,
+                "downgrade-hold is suppressing >50% of pending sequences",
+                [
+                    "reason: many transitions queued, hold ran, condition "
+                    "cleared before the timer fired. Either the hold is too "
+                    "long (over-smoothing) or the threshold is at a noise "
+                    f"band ({fmt_pct(s.near_l2_l3 / s.span)} time in the "
+                    "boundary).",
+                    "effect: real load drops never get the lower tier they "
+                    "deserve. Wasted W on AC, wasted battery on bat.",
+                    "options: shorter DOWNGRADE_HOLD_SEC, or move the "
+                    "threshold further from the noise band.",
+                ],
+            ))
+        elif rev_rate < 0.1 and pend_tot > 50:
+            recs.append((
+                INFO_COLOR,
+                "hold-timer almost always applies (~no transients filtered)",
+                [
+                    f"reason: pending sequences {pend_tot}; reverted only "
+                    f"{s.pend_reverted} ({fmt_pct(rev_rate)}).",
+                    "effect: the hold is just adding latency without "
+                    "catching noise. Could be shortened or removed.",
+                    "test: try UPGRADE_HOLD_SEC=0 and DOWNGRADE_HOLD_SEC=15 "
+                    "for a week; if chatter stays low this was load-bearing.",
+                ],
+            ))
+
+    # Gap warning. If we lost >10% of the window to gaps, the report's
+    # numbers are biased by whatever sessions survived.
+    if s.gap_secs / s.span > 0.10:
+        recs.append((
+            WARN_COLOR,
+            f"high gap rate ({fmt_pct(s.gap_secs / s.span)}) "
+            f"-- some numbers in this report are non-representative",
+            [
+                f"reason: {fmt_dur(s.gap_secs)} of the {fmt_dur(s.span)} "
+                "window has no autod tick log (daemon stopped, suspend, "
+                "or system off).",
+                "options: check `journalctl --user -u powertux-autod -e`; "
+                "verify the service is enabled with --now and Restart=on-failure.",
+            ],
+        ))
+
+    if not recs:
+        bullet(0, C("no tuning recommendations active for this window", OK_COLOR))
+        bullet(1, "chatter, L1 reach, cap-vs-cells drift, hold ratio, "
+                  "and coverage all within targets")
+        return
+
+    for clr, headline, reasons in recs:
+        bullet(0, C(headline, clr, bold=True))
+        for r in reasons:
+            bullet(1, r)
+        print()
+
+
+def section_residency(s):
+    section("Tier residency (overall / AC / battery)")
+    width = 32
+
+    def render(scope, c, total):
+        if total == 0:
+            print(f"  {scope:11s}  (no data)")
+            return
+        for i, lv in enumerate((1, 2, 3, 4)):
+            v = c.get(lv, 0)
+            b = bar(v, total, width)
+            pct = fmt_pct(v / total)
+            dur = fmt_dur(v)
+            name = TIER_NAME[lv]
+            name_pad = name + " " * (12 - len(name))
+            scope_lbl = scope if i == 0 else ""
+            print(f"  {scope_lbl:11s}  {C(name_pad, TIER_COLOR[lv])} "
+                  f"{C(b, TIER_COLOR[lv])}  {pct}  {dur}")
+
+    render("overall",    s.tier_total, sum(s.tier_total.values()))
+    print()
+    render("on AC",      s.tier_ac,    sum(s.tier_ac.values()))
+    print()
+    render("on battery", s.tier_bat,   sum(s.tier_bat.values()))
+
+
+def section_ribbon(s):
+    """High-resolution tier strip: variable cells/day (default sized to
+    terminal). Reveals tier sequencing in a way the 24-hour-per-day
+    timeline cannot. Useful to eyeball chatter clusters at a glance."""
+    # Adapt cell count to terminal width: 14 chars of left padding +
+    # cells. Cap at 192 (~7.5 min/cell) for daily resolution; min at 48
+    # (30 min/cell) to keep the ribbon readable on an 80-col tty.
+    avail = max(48, min(192, get_terminal_width() - 14))
+    cells_per_day = avail
+    sec_per_cell = 86400 // cells_per_day
+    minutes_per_cell = sec_per_cell // 60
+    section(f"Tier ribbon (one cell ~ {minutes_per_cell} min, "
+            f"color = dominant tier)")
+    CELLS_PER_DAY = cells_per_day
+    SEC_PER_CELL = sec_per_cell
+
+    by_day = defaultdict(list)
+    for r in s.rows:
+        by_day[r["_t"].date()].append(r)
+
+    # Compact axis showing 00 06 12 18 above the ribbon.
+    axis = [" "] * CELLS_PER_DAY
+    for hour, label in ((0, "00"), (6, "06"), (12, "12"), (18, "18")):
+        col = hour * 60 * 60 // SEC_PER_CELL
+        for j, ch in enumerate(label):
+            if col + j < CELLS_PER_DAY:
+                axis[col + j] = ch
+    print(f"  {'':12s}  " + "".join(axis))
+
+    for day in sorted(by_day.keys()):
+        cells = [" "] * CELLS_PER_DAY
+        for r in by_day[day]:
+            sec_of_day = (r["_t"].hour * 3600
+                          + r["_t"].minute * 60
+                          + r["_t"].second)
+            idx = min(CELLS_PER_DAY - 1, sec_of_day // SEC_PER_CELL)
+            lv = r.get("current")
+            if lv in (1, 2, 3, 4):
+                cells[idx] = C("█" if USE_UNICODE else "#", TIER_COLOR[lv])
+        print(f"  {day}    " + "".join(cells))
+    print()
+    legend = "  " + "  ".join(
+        f"{C('█' if USE_UNICODE else '#', TIER_COLOR[lv])} {TIER_NAME[lv]}"
+        for lv in (1, 2, 3, 4)
+    )
+    print(legend)
+
+
+def section_timeline(s):
+    section("Daily timeline (height = avg load1m, color = dominant tier)")
+    by_day = defaultdict(list)
+    for r in s.rows:
+        by_day[r["_t"].date()].append(r)
+
+    label_row = [" "] * 24
+    for h in (0, 3, 6, 9, 12, 15, 18, 21):
+        text = f"{h:02d}" if h >= 10 else f"{h}"
+        for i, ch in enumerate(text):
+            if h + i < 24:
+                label_row[h + i] = ch
+    print(f"  {'':12s}  " + "".join(label_row)
+          + "    total      AC%     drain")
+
+    for day in sorted(by_day.keys()):
+        rows_day = by_day[day]
+        cells = []
+        for h in range(24):
+            hr = [r for r in rows_day if r["_t"].hour == h]
+            if not hr:
+                cells.append(" ")
+                continue
+            avg = sum((r.get("load1m") or 0) for r in hr) / len(hr)
+            tiers = Counter(r["current"] for r in hr
+                            if r.get("current") in (1, 2, 3, 4))
+            dom = tiers.most_common(1)[0][0] if tiers else None
+            ch = spark(avg, 8.0)
+            cells.append(C(ch, TIER_COLOR.get(dom)) if dom else ch)
+        tot = len(rows_day) * TICK
+        ac = sum(1 for r in rows_day if r.get("ac") == 1) * TICK
+        # Approximate drain for the day: first cap minus last cap on the
+        # tail of any continuous battery sessions inside this day.
+        drain = 0
+        prev_cap = None
+        on_bat = False
+        for r in rows_day:
+            if r.get("ac") == 0 and r.get("cap") is not None:
+                if not on_bat:
+                    prev_cap = r["cap"]
+                    on_bat = True
+                else:
+                    if r["cap"] < prev_cap:
+                        drain += prev_cap - r["cap"]
+                    prev_cap = r["cap"]
+            else:
+                on_bat = False
+                prev_cap = None
+        ac_pct = fmt_pct(ac / tot) if tot else "  -  "
+        drain_s = f"{drain:3d}%" if drain else "  -  "
+        print(f"  {day}    " + "".join(cells)
+              + f"   {fmt_dur(tot):>6s}   {ac_pct}    {drain_s}")
+    print()
+    legend = "  legend: " + "  ".join(
+        C(TIER_NAME[lv], TIER_COLOR[lv]) for lv in (1, 2, 3, 4)
+    )
+    print(legend)
+
+
+def section_hour_of_day(s):
+    if len(s.days) < 2:
+        return
+    section("Hour-of-day pattern (tier share, aggregated across days)")
+    width = 32
+    for h in range(24):
+        c = Counter()
+        loads = []
+        for r in s.rows:
+            if r["_t"].hour != h:
+                continue
+            lv = r.get("current")
+            if lv in (1, 2, 3, 4):
+                c[lv] += TICK
+            loads.append(r.get("load1m") or 0)
+        total = sum(c.values())
+        if total == 0:
+            print(f"  {h:02d}:00  (no data)")
+            continue
+        out = []
+        used = 0
+        for lv in (1, 2, 3, 4):
+            v = c.get(lv, 0)
+            if v == 0:
+                continue
+            seg = max(1, round(v / total * width)) if v > 0 else 0
+            seg = min(seg, width - used)
+            out.append(
+                C("█" * seg if USE_UNICODE else "#" * seg, TIER_COLOR[lv])
+            )
+            used += seg
+        out.append(" " * (width - used))
+        avg = sum(loads) / len(loads) if loads else 0
+        print(f"  {h:02d}:00  " + "".join(out)
+              + f"  load {avg:4.2f}  {fmt_dur(total)}")
+
+
+def section_transitions(s):
+    section("Tier transitions per hour (^ upgrade, v downgrade)")
+    if not s.transitions:
+        print("  no transitions in this window")
+        return
+    ups = Counter()
+    downs = Counter()
+    pairs = Counter()
+    for t, p, c in s.transitions:
+        if c > p:
+            ups[t.hour] += 1
+        else:
+            downs[t.hour] += 1
+        pairs[(p, c)] += 1
+    total_u = sum(ups.values())
+    total_d = sum(downs.values())
+    total = total_u + total_d
+    span_hours = max(1, s.auto / 3600)
+    print(f"  total: {total} ({total_u} up, {total_d} down) "
+          f"-> {total / span_hours:4.2f}/hr in auto mode")
+    print()
+    max_v = max((ups.get(h, 0) + downs.get(h, 0)) for h in range(24))
+    for h in range(24):
+        u, d = ups.get(h, 0), downs.get(h, 0)
+        tot = u + d
+        if tot == 0:
+            continue
+        full_bar = bar(tot, max_v, 28)
+        visible = full_bar.rstrip()
+        up_len = round(len(visible) * u / tot) if tot else 0
+        up_part = visible[:up_len]
+        dn_part = visible[up_len:]
+        colored = (
+            (C(up_part, TIER_COLOR[4]) if up_part else "")
+            + (C(dn_part, TIER_COLOR[1]) if dn_part else "")
+            + (" " * (len(full_bar) - len(visible)))
+        )
+        print(f"  {h:02d}:00  {colored}  {tot:3d}  ({u:2d}^ {d:2d}v)")
+
+    print()
+    print("  Tier-pair transition matrix:")
+    for (p, c), n in sorted(pairs.items(), key=lambda x: -x[1]):
+        arrow = "→" if USE_UNICODE else "->"
+        pct = n / total * 100
+        bar_w = bar(n, max(pairs.values()), 20)
+        a_clr = TIER_COLOR[p]
+        b_clr = TIER_COLOR[c]
+        print(f"    {C(TIER_SHORT[p], a_clr)} {arrow} "
+              f"{C(TIER_SHORT[c], b_clr)}  {n:>4d}  ({pct:4.1f}%)  {bar_w}")
+
+
+def section_chatter(s):
+    """Chatter root-cause. The summary already prints the headline number;
+    here we break it down by tier pair, by hour, and by load band so the
+    user can see WHY chatter is happening, not just THAT it is."""
+    section("Chatter analysis (transitions reversed within 5 min)")
+    if not s.transitions:
+        print("  no transitions in this window")
+        return
+    chatter_pairs = Counter()
+    chatter_hours = Counter()
+    chatter_loads = []
+    chatter_count = 0
+    for i, (t, p, _) in enumerate(s.transitions):
+        for j in range(i + 1, len(s.transitions)):
+            t2, _, n2 = s.transitions[j]
+            if (t2 - t).total_seconds() > CHATTER_WINDOW_SEC:
+                break
+            if n2 == p:
+                chatter_pairs[tuple(sorted((p, n2)))] += 1
+                chatter_hours[t.hour] += 1
+                # Find load1m at the transition time
+                # (look in rows near t for the corresponding tick).
+                # Walk a small forward window from t for the first row whose
+                # _t matches; the loop is bounded by tick gap, so cheap.
+                for r in s.rows:
+                    if r["_t"] >= t:
+                        chatter_loads.append(r.get("load1m") or 0)
+                        break
+                chatter_count += 1
+                break
+
+    if chatter_count == 0:
+        print(C("  no chatter detected (target <{:.0f}% met)".format(
+            TARGET_CHATTER_PCT), OK_COLOR))
+        return
+
+    verdict_clr = (CRIT_COLOR if s.chatter_pct > 50
+                   else WARN_COLOR if s.chatter_pct > TARGET_CHATTER_PCT
+                   else OK_COLOR)
+    kv("chatter rate",
+       f"{chatter_count}/{len(s.transitions)} transitions "
+       f"({s.chatter_pct:.1f}%)", value_color=verdict_clr)
+    kv("window",
+       f"reversal within {CHATTER_WINDOW_SEC // 60}m of original transition")
+
+    print()
+    print("  by tier pair:")
+    for (a, b), n in sorted(chatter_pairs.items(), key=lambda x: -x[1]):
+        arrow = "↔" if USE_UNICODE else "<->"
+        bar_w = bar(n, max(chatter_pairs.values()), 24)
+        pct = n / chatter_count * 100
+        print(f"    {C(TIER_SHORT[a], TIER_COLOR[a])} {arrow} "
+              f"{C(TIER_SHORT[b], TIER_COLOR[b])}  {n:>4d}  "
+              f"({pct:4.1f}%)  {bar_w}")
+
+    if chatter_hours:
+        print()
+        print("  by hour:")
+        max_h = max(chatter_hours.values())
+        for h in range(24):
+            n = chatter_hours.get(h, 0)
+            if n == 0:
+                continue
+            print(f"    {h:02d}:00  {bar(n, max_h, 24)}  {n:3d}")
+
+    if chatter_loads:
+        print()
+        loads_s = sorted(chatter_loads)
+        m = len(loads_s)
+        print("  load1m at chattering transitions:")
+        print(f"    p10 {loads_s[m // 10]:.2f}  "
+              f"p50 {loads_s[m // 2]:.2f}  "
+              f"p90 {loads_s[min(m - 1, int(m * 0.9))]:.2f}  "
+              f"max {loads_s[-1]:.2f}")
+        # Bin into hysteresis-relevant buckets.
+        thr_bands = [
+            (0, 1.5, "<1.5"),
+            (1.5, 2.0, "1.5-2.0"),
+            (2.0, 2.5, "2.0-2.5"),
+            (2.5, 8.0, "2.5-8.0"),
+            (8.0, math.inf, ">=8"),
+        ]
+        for lo, hi, lbl in thr_bands:
+            n = sum(1 for x in chatter_loads if lo <= x < hi)
+            if n:
+                print(f"      {lbl:>8s}: {n:3d}  {bar(n, len(chatter_loads), 20)}")
+
+
+def section_load_histogram(s):
+    section("Load distribution (load1m vs load5m vs load15m)")
+    edges = [0, 0.5, 1, 2, 4, 8, 16, math.inf]
+    labels = ["<0.5", "0.5-1", "1-2", "2-4", "4-8", "8-16", ">=16"]
+    counts_1m = [0] * len(labels)
+    counts_5m = [0] * len(labels)
+    counts_15m = [0] * len(labels)
+    for r in s.rows:
+        for src, counts in (("load1m", counts_1m), ("load5m", counts_5m),
+                            ("load15m", counts_15m)):
+            l = r.get(src, 0) or 0
+            for i in range(len(labels)):
+                if l < edges[i + 1]:
+                    counts[i] += 1
+                    break
+    total = sum(counts_1m)
+    if total == 0:
+        print("  no data")
+        return
+    max_c = max(max(counts_1m), max(counts_5m), max(counts_15m))
+    print(f"  {'bin':>7s}  {'load1m':>30s}  {'load5m':>11s}  {'load15m':>11s}")
+    for label, c1, c5, c15 in zip(labels, counts_1m, counts_5m, counts_15m):
+        b = bar(c1, max_c, 28)
+        print(f"  {label:>7s}  {b}  "
+              f"{fmt_pct(c1 / total)}  {fmt_pct(c5 / total)}  "
+              f"{fmt_pct(c15 / total)}")
+    loads_1m = sorted(r.get("load1m", 0) or 0 for r in s.rows)
+    if loads_1m:
+        p50 = loads_1m[len(loads_1m) // 2]
+        p95 = loads_1m[int(len(loads_1m) * 0.95)]
+        p99 = loads_1m[int(len(loads_1m) * 0.99)]
+        print()
+        print(f"  load1m percentiles: p50 {p50:.2f}   p95 {p95:.2f}   "
+              f"p99 {p99:.2f}   max {loads_1m[-1]:.2f}")
+        # Concentration around L2/L3 boundary (the chatter cause).
+        near = sum(1 for x in loads_1m if 1.5 <= x <= 2.5) / len(loads_1m)
+        if near > 0.10:
+            print(f"  {C('warn:', WARN_COLOR)} "
+                  f"{fmt_pct(near)} of ticks have load1m in [1.5, 2.5] "
+                  "(the L2/L3 decision boundary band)")
+
+
+def section_power_timeline(s):
+    """Energy + voltage + cap sparkline over time. The cheap way to see
+    a session in one row each."""
+    have_w = [r for r in s.rows if r.get("w_sys") is not None]
+    if not have_w:
+        return
+    section("Power timeline (battery sessions, 60-cell sparklines)")
+    by_session = []
+    cur = []
+    for r in s.rows:
+        if r.get("status") == "Discharging":
+            cur.append(r)
+        elif cur:
+            by_session.append(cur)
+            cur = []
+    if cur:
+        by_session.append(cur)
+    if not by_session:
+        print("  no discharge sessions")
+        return
+    print(f"  {'start':<20}  {'dur':>6s}  {'avg_W':>7s}  "
+          f"{'med_W':>7s}  {'p95_W':>7s}  {'wh':>6s}  spark (low->high W)")
+    for sess in by_session:
+        ws = [r["w_sys"] for r in sess if r.get("w_sys") is not None]
+        if not ws:
+            continue
+        dur = (sess[-1]["_t"] - sess[0]["_t"]).total_seconds()
+        avg = sum(ws) / len(ws)
+        med = sorted(ws)[len(ws) // 2]
+        p95 = sorted(ws)[int(len(ws) * 0.95)]
+        wh = avg * dur / 3600
+        # Build sparkline scaled per session.
+        n_cells = 60
+        chunk = max(1, len(ws) // n_cells)
+        lo, hi = min(ws), max(ws)
+        rng = max(0.1, hi - lo)
+        cells = []
+        for i in range(0, len(ws), chunk):
+            blk = ws[i:i + chunk]
+            avg_blk = sum(blk) / len(blk)
+            cells.append(spark(avg_blk - lo, rng))
+        spark_line = "".join(cells)
+        print(f"  {sess[0]['_t'].strftime('%Y-%m-%d %H:%M'):<20}  "
+              f"{fmt_dur(dur):>6s}  {avg:6.2f}W  {med:6.2f}W  "
+              f"{p95:6.2f}W  {wh:5.1f}Wh  {spark_line}")
+
+
+def section_baseline(s):
+    section("vs baseline (CPU package energy; lower = better)")
+    obs_ac_j = cf_ac_j = obs_bat_j = cf_bat_j = 0.0
+    ac_ticks = bat_ticks = 0
+    ac_meas = bat_meas = 0
+    w_sys_sum = 0.0
+    w_sys_n = 0
+    for r in s.rows:
+        cur = r.get("current")
+        if cur not in (1, 2, 3, 4):
+            continue
+        load = r.get("load1m") or 0
+        ac = r.get("ac") == 1
+        obs_w = r.get("w_pkg")
+        if obs_w is None:
+            idle_w, load_w = TIER_W[cur]
+            obs_w = w_at(idle_w, load_w, load)
+            measured = False
+        else:
+            measured = True
+        b_idle, b_load = BASELINE_AC if ac else BASELINE_BAT
+        cf_w = w_at(b_idle, b_load, load)
+        if ac:
+            obs_ac_j += obs_w * TICK
+            cf_ac_j += cf_w * TICK
+            ac_ticks += 1
+            ac_meas += int(measured)
+        else:
+            obs_bat_j += obs_w * TICK
+            cf_bat_j += cf_w * TICK
+            bat_ticks += 1
+            bat_meas += int(measured)
+            ws = r.get("w_sys")
+            if ws is not None:
+                w_sys_sum += ws
+                w_sys_n += 1
+
+    if ac_ticks + bat_ticks == 0:
+        print("  no data with applied tier")
+        return
+
+    def fmt_wh(j):
+        return f"{j / 3600:6.2f} Wh"
+
+    def line(label, obs_j, cf_j, ticks, meas):
+        if ticks == 0:
+            print(f"  {label:14s}  (no time)")
+            return
+        saved_j = cf_j - obs_j
+        saved_pct = (saved_j / cf_j * 100) if cf_j > 0 else 0
+        verdict = "saved" if saved_j >= 0 else "spent extra"
+        clr = OK_COLOR if saved_j >= 0 else CRIT_COLOR
+        meas_pct = meas / ticks * 100
+        src = f"({meas_pct:>3.0f}% measured)"
+        print(f"  {label:11s}  obs {fmt_wh(obs_j)}  vs baseline "
+              f"{fmt_wh(cf_j)}  "
+              f"-> {C(verdict, clr)} {abs(saved_j) / 3600:5.2f} Wh "
+              f"({abs(saved_pct):4.1f}%) {src}")
+
+    print("  source: w_pkg field where present, else estimated from tier+load.")
+    print()
+    line("on AC",      obs_ac_j,  cf_ac_j,  ac_ticks,  ac_meas)
+    line("on battery", obs_bat_j, cf_bat_j, bat_ticks, bat_meas)
+    line("total",
+         obs_ac_j + obs_bat_j, cf_ac_j + cf_bat_j,
+         ac_ticks + bat_ticks, ac_meas + bat_meas)
+    print()
+    print("  baselines (package W):")
+    print(f"    AC       TUXEDO Defaults    "
+          f"idle {BASELINE_AC[0]:5.2f}W   load {BASELINE_AC[1]:5.2f}W")
+    print(f"    battery  Battery Efficient  "
+          f"idle {BASELINE_BAT[0]:5.2f}W   load {BASELINE_BAT[1]:5.2f}W")
+    if w_sys_n > 0:
+        avg_sys = w_sys_sum / w_sys_n
+        print(f"    BAT0 V*I avg (full system, battery only): {avg_sys:.2f}W "
+              f"over {fmt_dur(w_sys_n * TICK)}")
+
+
+def section_display_attribution(s):
+    """Empirically attribute battery power to each external display set.
+
+    Group ticks by the (sorted) `displays` field; compute median w_sys per
+    group. The "no externals" group is the baseline; every other group's
+    median above baseline is the cost of THAT display set.
+
+    Pairs (display, no-display) within the same workload type give the
+    cleanest signal. For a heterogeneous workload we report the median per
+    set with a warning when n < 60 (5 minutes of data).
+    """
+    # Need displays field + w_sys (battery only).
+    have = [r for r in s.rows
+            if r.get("displays") is not None and r.get("w_sys") is not None]
+    if not have:
+        return
+    section("Per-display power attribution (battery w_sys, by display set)")
+    by_set = defaultdict(list)
+    for r in have:
+        # Normalize: tuple of displays for groupable key.
+        ds = tuple(r["displays"]) if r["displays"] else ()
+        by_set[ds].append(r["w_sys"])
+
+    # Build a baseline: the group with no externals (or smallest set).
+    base_key = () if () in by_set else min(by_set.keys(), key=len)
+    base_med = (statistics.median(by_set[base_key])
+                if by_set[base_key] else None)
+
+    print(f"  {'display set':<40}  {'n':>5s}  {'med W':>7s}  "
+          f"{'p10 W':>7s}  {'p90 W':>7s}  {'attr W':>8s}")
+    sets_sorted = sorted(by_set.keys(),
+                         key=lambda k: (len(k), tuple(k)))
+    for k in sets_sorted:
+        ws = by_set[k]
+        if not ws:
+            continue
+        n = len(ws)
+        med = statistics.median(ws)
+        p10 = percentile(ws, 10)
+        p90 = percentile(ws, 90)
+        attr = med - base_med if base_med is not None else 0.0
+        attr_clr = (CRIT_COLOR if abs(attr) > 5
+                    else WARN_COLOR if abs(attr) > 2
+                    else None)
+        attr_str = f"{attr:+5.2f}W" if k != base_key else "  base "
+        if attr_clr and k != base_key:
+            attr_str = C(attr_str, attr_clr)
+        label = (", ".join(k) if k else "(none / internal only)")
+        if len(label) > 38:
+            label = label[:35] + "..."
+        if n < 60:
+            label = C(label, DIM_COLOR)
+        print(f"  {label:<40}  {n:>5d}  {med:6.2f}W  "
+              f"{p10:6.2f}W  {p90:6.2f}W  {attr_str:>8s}")
+
+    print()
+    print("  attribution = median w_sys for this set minus the no-external "
+          "baseline.")
+    print("  bus-powered displays (e.g. USB-C portable monitors) surface as ")
+    print("  positive attribution; self-powered displays (HDMI/DP with own ")
+    print("  PSU) net near zero. Dim rows have <60 samples (5 min); treat ")
+    print("  their delta as suggestive, not load-bearing.")
+    if len(by_set) < 2:
+        print()
+        print(C(
+            "  only one display set in this window; plug/unplug a monitor "
+            "while", DIM_COLOR))
+        print(C(
+            "  on battery to populate the attribution table.", DIM_COLOR))
+
+    # Also print the PD partner ceiling for context.
+    pd_max = [r["pd_partner_max_w"] for r in s.rows
+              if r.get("pd_partner_max_w") is not None]
+    if pd_max:
+        pd_med = statistics.median(pd_max)
+        print(f"  USB-PD partner sink-cap ceiling (nameplate): {pd_med:.1f}W "
+              f"(median across window, sum of all sinking partners)")
+
+
+def section_battery(s):
+    section("Battery sessions")
+    bat_rows = [r for r in s.rows if r.get("ac") == 0]
+    if not bat_rows:
+        print("  no battery time in this window")
+        return
+    print(f"  sessions: {len(s.sessions)}  "
+          f"total time on bat: {fmt_dur(len(bat_rows) * TICK)}  "
+          f"drained {s.drain_pct:.0f}%  "
+          f"aggregate drain rate {s.drain_rate:.2f}%/hr")
+    print()
+    print(f"  {'#':<3} {'start':<20} {'dur':>7s}  {'cap0':>5s}  "
+          f"{'cap1':>5s}  {'%/hr':>7s}  {'avg W':>7s}  {'tier':>4s}")
+    for i, sess in enumerate(s.sessions):
+        c0 = sess[0].get("cap")
+        c1 = sess[-1].get("cap")
+        if c0 is None or c1 is None:
+            continue
+        secs = (sess[-1]["_t"] - sess[0]["_t"]).total_seconds()
+        rate = (c0 - c1) / secs * 3600 if secs > 0 and c0 > c1 else 0
+        ws = [r["w_sys"] for r in sess if r.get("w_sys") is not None]
+        avg_w = sum(ws) / len(ws) if ws else None
+        tiers = Counter(r["current"] for r in sess
+                        if r.get("current") in (1, 2, 3, 4))
+        dom = tiers.most_common(1)[0][0] if tiers else None
+        dom_str = C(TIER_SHORT[dom], TIER_COLOR[dom]) if dom else "  -"
+        avg_str = f"{avg_w:5.2f}W" if avg_w is not None else "    -"
+        print(f"  {i:<3} {sess[0]['_t'].strftime('%Y-%m-%d %H:%M'):<20} "
+              f"{fmt_dur(secs):>7s}  {c0:>4d}%  {c1:>4d}%  "
+              f"{rate:5.2f}%/hr  {avg_str:>7s}  {dom_str:>4s}")
+
+    # Capacity sparkline across the window.
+    caps = [r.get("cap", 0) for r in bat_rows]
+    if len(caps) >= 2:
+        n_cells = 60
+        chunk = max(1, len(caps) // n_cells)
+        cells = []
+        for i in range(0, len(caps), chunk):
+            block = caps[i:i + chunk]
+            avg = sum(block) / len(block)
+            cells.append(spark(avg, 100))
+        print()
+        print(f"  capacity over time   {caps[0]:3d}% "
+              f"{''.join(cells)} {caps[-1]:3d}%")
+
+
+def section_pending(s):
+    section("Pending-tier outcome (hold-timer effectiveness)")
+    total = s.pend_applied + s.pend_reverted
+    if total == 0:
+        print("  no pending sequences in this window")
+        return
+    kv("total sequences", str(total))
+    kv("applied",
+       f"{s.pend_applied} ({fmt_pct(s.pend_applied / total)})  "
+       "-> load/AC change stuck around long enough")
+    kv("reverted",
+       f"{s.pend_reverted} ({fmt_pct(s.pend_reverted / total)})  "
+       "-> hold-timer suppressed a transient")
+
+
+def section_policy(s):
+    section("Decision-table validation (auto mode only)")
+    grid = defaultdict(Counter)
+    for r in s.rows:
+        if r.get("mode") != "auto":
+            continue
+        cur = r.get("current")
+        if cur not in (1, 2, 3, 4):
+            continue
+        grid[policy_cell(r)][cur] += 1
+    cap_rows = [
+        ("AC", "AC"),
+        ("B+", "Bat>=60"),
+        ("B=", "Bat 30-60"),
+        ("B-", "Bat <30"),
+    ]
+    load_cols = [(0, "load<2"), (1, "load 2-8"), (2, "load>=8")]
+    print(f"  {'':10s} " + " ".join(f"{lbl:>20s}" for _, lbl in load_cols))
+    for cap_b, cap_lbl in cap_rows:
+        cells = []
+        for load_b, _ in load_cols:
+            c = grid.get((cap_b, load_b), Counter())
+            total = sum(c.values())
+            if total == 0:
+                cells.append(f"{'-':>20s}")
+                continue
+            dom_lv, dom_n = c.most_common(1)[0]
+            exp = EXPECTED[(cap_b, load_b)]
+            tag = TIER_SHORT[dom_lv]
+            if dom_lv != exp:
+                tag = tag + "*"
+            share = dom_n / total
+            colored = C(tag, TIER_COLOR[dom_lv])
+            plain = f"{tag} {fmt_pct(share)} {fmt_dur(total * TICK):>5s}"
+            pad = " " * max(0, 20 - len(plain))
+            cells.append(pad + colored + plain[len(tag):])
+        print(f"  {cap_lbl:10s} " + " ".join(cells))
+    print()
+    print("  '*' = observed dominant tier diverges from documented policy")
+    print()
+    print("  Documented policy:")
+    print("    AC          L2 / L3 / L4")
+    print("    Bat>=60     L1 / L2 / L3")
+    print("    Bat 30-60   L1 / L2 / L2")
+    print("    Bat <30     L1 / L1 / L2")
+
+
+def section_threshold_sensitivity(s):
+    """How sensitive is the report to each decision-table boundary?
+
+    We don't simulate the daemon with new thresholds (that belongs in a
+    dedicated replay tool). Instead, we surface the % of time load1m and
+    capacity sit within ±20% of each documented boundary. High =
+    boundary is at a noise band, expect chatter or false transitions
+    there.
+    """
+    section("Threshold sensitivity (time spent near each decision boundary)")
+    BOUNDARIES = [
+        ("load1m", "L2/L3 boundary", 2.0, 0.5),
+        ("load1m", "L3/L4 boundary", 8.0, 2.0),
+        ("cap",    "Bat>=60 / 30-60 boundary", 60.0, 10.0),
+        ("cap",    "Bat 30-60 / <30 boundary", 30.0, 10.0),
+    ]
+    print(f"  {'boundary':<32s}  {'thr':>6s}  {'band':>11s}  "
+          f"{'% time':>7s}  {'(samples)':>10s}")
+    for field, label, thr, band in BOUNDARIES:
+        vs = [r.get(field) for r in s.rows if r.get(field) is not None]
+        if not vs:
+            continue
+        n_in = sum(1 for v in vs if thr - band <= v <= thr + band)
+        share = n_in / len(vs)
+        verdict = (CRIT_COLOR if share > 0.30
+                   else WARN_COLOR if share > 0.10
+                   else None)
+        share_s = fmt_pct(share)
+        if verdict:
+            share_s = C(share_s, verdict)
+        band_s = f"[{thr - band:.1f}, {thr + band:.1f}]"
+        print(f"  {label:<32s}  {thr:>6.1f}  {band_s:>11s}  "
+              f"{share_s:>7s}  {n_in:>10d}")
+    print()
+    print("  >30% = chatter risk: the decision boundary lives in the "
+          "noise band.")
+    print("  >10% = worth a hysteresis band or longer hold.")
+
+
+def section_battery_voltage(s):
+    rows = s.rows
+    vrows = [r for r in rows if r.get("v_bat") is not None]
+    if not vrows:
+        det = sum(1 for r in rows if r.get("v_bat") is None
+                  and r.get("status") is None)
+        if det:
+            section("Battery voltage / SoC")
+            print(f"  BAT0 detached for the entire window "
+                  f"({fmt_dur(det * TICK)}).")
+            print("  No v_bat samples available.")
+        return
+    section("Battery voltage / SoC (OCV-estimated; per-cell)")
+    cells = detect_cells(vrows[0]["v_bat"])
+    v_sorted = sorted(r["v_bat"] for r in vrows)
+    n = len(v_sorted)
+    v_min, v_p50, v_max = v_sorted[0], v_sorted[n // 2], v_sorted[-1]
+    kv("cells detected",
+       f"{cells}S  (per-cell: min {v_min / cells:5.3f}V  "
+       f"p50 {v_p50 / cells:5.3f}V  max {v_max / cells:5.3f}V)")
+    kv("pack voltage",
+       f"min {v_min:.3f}V  p50 {v_p50:.3f}V  max {v_max:.3f}V")
+    kv("OCV-implied SoC",
+       f"min {ocv_soc(v_min / cells):4.1f}%   "
+       f"p50 {ocv_soc(v_p50 / cells):4.1f}%   "
+       f"max {ocv_soc(v_max / cells):4.1f}%")
+
+    status_secs = Counter()
+    for r in rows:
+        st = r.get("status")
+        if st:
+            status_secs[st] += TICK
+    total_secs = sum(status_secs.values())
+    if total_secs:
+        print()
+        print("  status time:")
+        for st, secs in sorted(status_secs.items(), key=lambda x: -x[1]):
+            print(f"    {st:15s} {fmt_dur(secs):>8s}  "
+                  f"{fmt_pct(secs / total_secs)}")
+
+    # Detach events.
+    detach_events = []
+    run_start = None
+    run_end = None
+    for r in rows:
+        if r.get("v_bat") is None:
+            if run_start is None:
+                run_start = r["_t"]
+            run_end = r["_t"]
+        else:
+            if run_start is not None:
+                detach_events.append((run_start, run_end))
+                run_start = None
+    if run_start is not None:
+        detach_events.append((run_start, run_end))
+    if detach_events:
+        print()
+        print(f"  BAT0 detach events: {len(detach_events)}")
+        for d_s, d_e in detach_events[-5:]:
+            dur = (d_e - d_s).total_seconds()
+            print(f"    {d_s} -> {d_e}  ({fmt_dur(dur)})")
+
+    # cap_th vs OCV-SoC drift.
+    cap_drift_max = -1
+    cap_drift_at_t = None
+    cap_drift_cap_th = None
+    above_cap_secs = 0
+    for r in vrows:
+        cth = r.get("cap_th")
+        if cth is None or cth >= 100 or cth <= 0:
+            continue
+        soc = ocv_soc(r["v_bat"] / cells)
+        if soc > cth:
+            above_cap_secs += TICK
+            d = soc - cth
+            if d > cap_drift_max:
+                cap_drift_max = d
+                cap_drift_at_t = r["_t"]
+                cap_drift_cap_th = cth
+    if above_cap_secs > 0:
+        print()
+        print("  OCV-SoC exceeded cap_th (cap not actually capping cells):")
+        print(f"    time above cap    {fmt_dur(above_cap_secs)}")
+        print(f"    max drift         "
+              f"{C(f'OCV-SoC {cap_drift_max + cap_drift_cap_th:.1f}%', CRIT_COLOR)} "
+              f"vs cap_th {cap_drift_cap_th}  "
+              f"({C(f'+{cap_drift_max:.1f}%', CRIT_COLOR)})")
+        print(f"    at                {cap_drift_at_t}")
+
+    # Kernel cap vs OCV-SoC delta.
+    pairs = [
+        (r["cap"], ocv_soc(r["v_bat"] / cells))
+        for r in vrows if r.get("cap") is not None
+    ]
+    if pairs:
+        deltas = sorted(soc - cap for cap, soc in pairs)
+        m = len(deltas)
+        print()
+        print("  kernel cap% vs OCV-SoC% "
+              "(positive = cells fuller than kernel reports):")
+        print(f"    min {deltas[0]:+6.1f}   "
+              f"p50 {deltas[m // 2]:+6.1f}   "
+              f"p95 {deltas[min(m - 1, int(m * 0.95))]:+6.1f}   "
+              f"max {deltas[-1]:+6.1f}")
+
+    # Voltage sparkline.
+    vt = [r["v_bat"] for r in vrows]
+    if len(vt) >= 2:
+        v_lo = min(vt)
+        v_hi = max(vt)
+        rng = max(0.001, v_hi - v_lo)
+        n_cells = 60
+        chunk = max(1, len(vt) // n_cells)
+        cells_out = []
+        for i in range(0, len(vt), chunk):
+            block = vt[i:i + chunk]
+            avg = sum(block) / len(block)
+            cells_out.append(spark(avg - v_lo, rng))
+        print()
+        print(f"  voltage over time   {v_lo:.2f}V "
+              f"{''.join(cells_out)} {v_hi:.2f}V")
+
+    # cap_th change events.
+    cap_th_events = []
+    last = object()
+    for r in rows:
+        cth = r.get("cap_th")
+        if cth != last:
+            cap_th_events.append(
+                (r["_t"], cth, r.get("cap"),
+                 ocv_soc(r["v_bat"] / cells) if r.get("v_bat") else None)
+            )
+            last = cth
+    if len(cap_th_events) > 1:
+        print()
+        print("  cap threshold changes:")
+        for t, cth, kcap, soc in cap_th_events:
+            cth_lbl = ("detached" if cth is None
+                       else "no cap (0)" if cth == 0
+                       else f"cap_th={cth}")
+            kcap_lbl = f"kernel={kcap}%" if kcap is not None else "kernel=?"
+            soc_lbl = f"OCV={soc:.0f}%" if soc is not None else "OCV=?"
+            print(f"    {t}  {cth_lbl:<12s}  {kcap_lbl}  {soc_lbl}")
+
+
+def section_battery_gauge(s):
+    rows = s.rows
+    have = [r for r in rows if r.get("raw_xif1_mah") is not None]
+    if not have:
+        return
+    section("Battery gauge / wear (EC truth, not kernel ABI)")
+    latest = have[-1]
+    x1 = latest["raw_xif1_mah"]
+    x2 = latest["raw_xif2_mah"]
+    rc = latest.get("raw_cycles")
+    if x1 and x2:
+        pct_of_design = x2 / x1 * 100
+        wear = 100 - pct_of_design
+        kv("design capacity", f"{x1} mAh  (raw_xif1)")
+        kv("EC-believed full", f"{x2} mAh  (raw_xif2)")
+        kv("fraction of design", f"{pct_of_design:5.2f}%")
+        kv("apparent wear", f"{wear:5.2f}%",
+           value_color=WARN_COLOR if wear > 5 else None)
+    if rc is not None:
+        first_rc = next((r["raw_cycles"] for r in have
+                         if r.get("raw_cycles") is not None), None)
+        if first_rc is not None and rc != first_rc:
+            kv("cycle count",
+               f"{first_rc} -> {rc}  (+{rc - first_rc} in window)")
+        else:
+            kv("cycle count", f"{rc} cycles total (raw_cycle_count)")
+
+    events = []
+    last = None
+    for r in have:
+        v = r.get("raw_xif2_mah")
+        if v is not None and v != last:
+            events.append((r["_t"], v))
+            last = v
+    if len(events) > 1:
+        print()
+        print("  raw_xif2 (learned-full) changes in window:")
+        for t, v in events[-10:]:
+            print(f"    {t}  {v} mAh")
+
+    kernel_cf = latest.get("charge_full")
+    kernel_cc = latest.get("cycle_count")
+    print()
+    print("  kernel ABI discrepancies on this board:")
+    if kernel_cf is not None:
+        kernel_cf_mah = kernel_cf // 1000
+        if kernel_cf_mah != x2:
+            print(f"    charge_full reports {kernel_cf_mah} mAh, "
+                  f"EC truth is {x2} mAh")
+        else:
+            print(f"    charge_full matches EC ({kernel_cf_mah} mAh)")
+    if kernel_cc is not None and rc is not None:
+        if kernel_cc != rc:
+            print(f"    cycle_count reports {kernel_cc}, EC truth is {rc}")
+        else:
+            print(f"    cycle_count matches EC ({rc})")
+
+
+def section_platform_drift(s):
+    auto_or_pinned = [r for r in s.rows
+                      if r.get("current") in (1, 2, 3, 4)]
+    if not auto_or_pinned:
+        return
+    section("Platform drift (pp/epp/boost/tccd vs expected for current tier)")
+    pp_epp_boost_drift = Counter()
+    tccd_drift = Counter()
+    for r in auto_or_pinned:
+        lv = r["current"]
+        exp_pp, exp_epp, exp_boost = EXPECTED_PP_EPP_BOOST[lv]
+        if ((r.get("pp") is not None and r["pp"] != exp_pp)
+                or (r.get("epp") is not None and r["epp"] != exp_epp)
+                or (r.get("boost") is not None and r["boost"] != exp_boost)):
+            mismatch = []
+            if r.get("pp") is not None and r["pp"] != exp_pp:
+                mismatch.append(f"pp={r['pp']}(exp {exp_pp})")
+            if r.get("epp") is not None and r["epp"] != exp_epp:
+                mismatch.append(f"epp={r['epp']}(exp {exp_epp})")
+            if r.get("boost") is not None and r["boost"] != exp_boost:
+                mismatch.append(f"boost={r['boost']}(exp {exp_boost})")
+            pp_epp_boost_drift[(lv, ", ".join(mismatch))] += 1
+        tccd = r.get("tccd_id")
+        if tccd is not None:
+            expected_tccd = TIER_TCCD_ID[lv]
+            if tccd != expected_tccd:
+                tccd_drift[(lv, tccd, expected_tccd)] += 1
+
+    have_pp_data = any(r.get("pp") is not None for r in auto_or_pinned)
+    have_tccd_data = any(r.get("tccd_id") is not None for r in auto_or_pinned)
+    if have_pp_data:
+        if pp_epp_boost_drift:
+            print("  pp/epp/boost drift events:")
+            for (lv, desc), n in sorted(pp_epp_boost_drift.items(),
+                                        key=lambda x: -x[1]):
+                print(f"    L{lv}: {n:>4d} ticks ({fmt_dur(n * TICK)})  "
+                      f"{desc}")
+        else:
+            print(C("  pp/epp/boost: clean. "
+                    "All ticks match expected per tier.", OK_COLOR))
+    else:
+        print("  pp/epp/boost: not logged in this window "
+              "(pre-telemetry-expansion logs).")
+
+    print()
+    if have_tccd_data:
+        if tccd_drift:
+            print("  tccd profile drift events:")
+            for (lv, observed, expected), n in sorted(tccd_drift.items(),
+                                                      key=lambda x: -x[1]):
+                print(f"    L{lv}: {n:>4d} ticks "
+                      f"({fmt_dur(n * TICK)})  "
+                      f"tccd={observed}  expected={expected}")
+        else:
+            print(C("  tccd profile: clean. Active tccd profile matches "
+                    "expected for current tier across all ticks.", OK_COLOR))
+    else:
+        print("  tccd profile: not logged in this window.")
+
+
+def section_thermal(s):
+    have = [r for r in s.rows if r.get("cpu_temp_c") is not None]
+    if not have:
+        return
+    section("Thermal (per tier, idle vs load split)")
+    by_lv = defaultdict(lambda: {"idle": [], "load": [], "gpu_idle": [],
+                                  "gpu_load": [], "mhz_idle": [], "mhz_load": []})
+    for r in have:
+        lv = r.get("current")
+        if lv not in (1, 2, 3, 4):
+            continue
+        bucket = "load" if (r.get("load1m") or 0) >= 1 else "idle"
+        by_lv[lv][bucket].append(r["cpu_temp_c"])
+        if r.get("gpu_temp_c") is not None:
+            by_lv[lv][f"gpu_{bucket}"].append(r["gpu_temp_c"])
+        if r.get("cpu_mhz") is not None:
+            by_lv[lv][f"mhz_{bucket}"].append(r["cpu_mhz"])
+    print(f"  {'tier':6s}  {'CPU °C idle':>12s}  {'CPU °C load':>12s}  "
+          f"{'GPU °C load':>12s}  {'MHz idle/load':>15s}  {'n':>5s}")
+    for lv in (1, 2, 3, 4):
+        d = by_lv.get(lv)
+        if not d:
+            continue
+        cs_idle = sorted(d["idle"])
+        cs_load = sorted(d["load"])
+        gs_load = sorted(d["gpu_load"])
+        m_idle = sorted(d["mhz_idle"])
+        m_load = sorted(d["mhz_load"])
+        n = len(cs_idle) + len(cs_load)
+
+        def med(xs):
+            return xs[len(xs) // 2] if xs else None
+
+        ci = med(cs_idle)
+        cl = med(cs_load)
+        gl = med(gs_load)
+        mi = med(m_idle)
+        ml = med(m_load)
+        fmt = lambda x, unit="": f"{x:.1f}{unit}" if x is not None else "  -  "
+        print(f"  L{lv:<5d}  {fmt(ci):>12s}  {fmt(cl):>12s}  "
+              f"{fmt(gl):>12s}  "
+              f"{(f'{mi:.0f} / {ml:.0f}' if mi and ml else '  -'):>15s}  "
+              f"{n:>5d}")
+
+
+def section_calibration(s):
+    section("Calibration health (auto mode only)")
+    auto_rows = [r for r in s.rows if r.get("mode") == "auto"]
+    if not auto_rows:
+        print("  no auto-mode time in this window")
+        return
+    total_t = len(s.transitions)
+    chatter_pct = (f"{s.chatter / total_t * 100:4.1f}%"
+                   if total_t else "  -  ")
+    kv("transitions", str(total_t))
+    kv("chatter <5min", f"{s.chatter} ({chatter_pct})")
+
+    # Latency: time from (target != current) to convergence.
+    up_lats, down_lats = [], []
+    pend_start = pend_target = pend_prev = None
+    last_t = None
+    last_mode = None
+    for r in s.rows:
+        t = r["_t"]
+        mode = r.get("mode")
+        cur = r.get("current")
+        tgt = r.get("target")
+        discontinuity = (
+            (last_t is not None and (t - last_t).total_seconds() > TICK * 2)
+            or (last_mode is not None and mode != last_mode)
+        )
+        if discontinuity:
+            pend_start = pend_target = pend_prev = None
+        last_t = t
+        last_mode = mode
+        if mode != "auto" or cur not in (1, 2, 3, 4):
+            continue
+        if pend_start is None:
+            if tgt != cur:
+                pend_start, pend_target, pend_prev = t, tgt, cur
+        else:
+            if cur == pend_target:
+                lat = (t - pend_start).total_seconds()
+                (up_lats if pend_target > pend_prev else down_lats).append(lat)
+                pend_start = pend_target = pend_prev = None
+            elif tgt != pend_target:
+                pend_start, pend_target, pend_prev = t, tgt, cur
+
+    def lat_line(label, lats, hold):
+        if not lats:
+            print(f"  {label:20s} n=0  (hold={hold}s configured)")
+            return
+        lats = sorted(lats)
+        n = len(lats)
+        print(f"  {label:20s} n={n:<3d}  p50={lats[n // 2]:3.0f}s  "
+              f"p95={lats[min(n - 1, int(n * 0.95))]:3.0f}s  "
+              f"max={lats[-1]:3.0f}s  (hold={hold}s)")
+    print()
+    lat_line("upgrade latency",   up_lats,   UPGRADE_HOLD_SEC)
+    lat_line("downgrade latency", down_lats, DOWNGRADE_HOLD_SEC)
+
+    # Pending duration histograms.
+    pend_app, pend_rev = [], []
+    in_pend = False
+    p_target = None
+    p_start = None
+    last_t = None
+    last_mode = None
+    for r in s.rows:
+        t = r["_t"]
+        mode = r.get("mode")
+        c = r.get("current")
+        p = r.get("pending")
+        discontinuity = (
+            (last_t is not None and (t - last_t).total_seconds() > TICK * 2)
+            or (last_mode is not None and mode != last_mode)
+        )
+        if discontinuity and in_pend:
+            in_pend = False
+            p_target = p_start = None
+        last_t = t
+        last_mode = mode
+        if mode != "auto":
+            continue
+        if p is not None:
+            if not in_pend:
+                in_pend = True
+                p_target = p
+                p_start = t
+            elif p != p_target:
+                pend_rev.append((t - p_start).total_seconds())
+                p_target = p
+                p_start = t
+        else:
+            if in_pend:
+                dur = (t - p_start).total_seconds()
+                (pend_app if c == p_target else pend_rev).append(dur)
+                in_pend = False
+
+    def dur_line(label, ds):
+        if not ds:
+            print(f"  {label:20s} n=0")
+            return
+        ds_s = sorted(ds)
+        n = len(ds_s)
+        print(f"  {label:20s} n={n:<3d}  avg={sum(ds_s) / n:3.0f}s  "
+              f"p50={ds_s[n // 2]:3.0f}s  "
+              f"range [{ds_s[0]:3.0f}s, {ds_s[-1]:3.0f}s]")
+    print()
+    dur_line("pending applied",  pend_app)
+    dur_line("pending reverted", pend_rev)
+
+    # Pin override votes.
+    overrides = Counter()
+    last_mode = None
+    last_auto_cur = None
+    for r in s.rows:
+        m = r.get("mode")
+        c = r.get("current")
+        if m == "auto" and c in (1, 2, 3, 4):
+            last_auto_cur = c
+        if (last_mode == "auto" and m == "pinned"
+                and last_auto_cur and c in (1, 2, 3, 4)):
+            overrides[(last_auto_cur, c)] += 1
+            last_auto_cur = None
+        last_mode = m
+    total_ov = sum(overrides.values())
+    up_ov = sum(n for (a, p), n in overrides.items() if p > a)
+    down_ov = sum(n for (a, p), n in overrides.items() if p < a)
+    same_ov = sum(n for (a, p), n in overrides.items() if p == a)
+    print()
+    print(f"  auto->pinned events  {total_ov}  "
+          f"(pinned higher: {up_ov}  lower: {down_ov}  same: {same_ov})")
+    if up_ov + down_ov > 0:
+        for (a, p), n in sorted(overrides.items()):
+            if a != p:
+                arrow = "up" if p > a else "down"
+                print(f"    L{a} -> L{p} {arrow:>4s}  x{n}")
+
+
+def section_environment(s):
+    """Brightness, kbd backlight, lid, displays_ext, charging_profile.
+    Each correlated with battery w_sys when it's a meaningful axis."""
+    have = [r for r in s.rows
+            if r.get("brightness_pct") is not None]
+    if not have:
+        return
+    section("Environment context")
+    bri = sorted(r["brightness_pct"] for r in have)
+    if bri:
+        kv("brightness",
+           f"min {bri[0]}%  p50 {bri[len(bri) // 2]}%  max {bri[-1]}%  "
+           f"({fmt_dur(len(bri) * TICK)} of data)")
+    kbd = [r["kbd_backlight_pct"] for r in have
+           if r.get("kbd_backlight_pct") is not None]
+    if kbd:
+        kbd_s = sorted(kbd)
+        kv("kbd backlight",
+           f"min {kbd_s[0]}%  p50 {kbd_s[len(kbd_s) // 2]}%  "
+           f"max {kbd_s[-1]}%")
+    lid_counts = Counter(r.get("lid") for r in s.rows
+                         if r.get("lid") is not None)
+    if lid_counts:
+        tot = sum(lid_counts.values())
+        kv("lid",
+           "  ".join(f"{state}: {fmt_pct(n / tot)} "
+                     f"({fmt_dur(n * TICK)})"
+                     for state, n in lid_counts.most_common()))
+    cp = Counter(r.get("charging_profile") for r in s.rows
+                 if r.get("charging_profile") is not None)
+    if cp:
+        tot = sum(cp.values())
+        kv("charging profile",
+           "  ".join(f"{p}: {fmt_pct(n / tot)} "
+                     f"({fmt_dur(n * TICK)})"
+                     for p, n in cp.most_common()))
+
+    # Brightness vs power correlation (battery only).
+    bat_bri_w = [(r["brightness_pct"], r["w_sys"]) for r in have
+                 if r.get("w_sys") is not None and r.get("ac") == 0
+                 and r.get("brightness_pct") is not None]
+    if len(bat_bri_w) > 30:
+        by_bri = defaultdict(list)
+        # bin brightness into 25%-wide buckets
+        for b, w in bat_bri_w:
+            bucket = (b // 25) * 25
+            by_bri[bucket].append(w)
+        print()
+        print("  brightness vs battery w_sys (battery only, median W per "
+              "25%-wide bucket):")
+        for bucket in sorted(by_bri.keys()):
+            ws = by_bri[bucket]
+            med = statistics.median(ws)
+            b = bar(med, max(statistics.median(v) for v in by_bri.values()),
+                    24)
+            print(f"    {bucket:>3d}-{bucket + 24}%  {b}  "
+                  f"{med:5.2f}W  (n={len(ws)})")
+
+
+def section_highlights(s):
+    """Highlights reel: notable events, biggest swings, etc."""
+    section("Highlights / events")
+    # AC edges
+    edges = []
+    last = None
+    for r in s.rows:
+        a = r.get("ac")
+        if last is not None and a != last:
+            edges.append((r["_t"], "plug-in" if a == 1 else "unplug"))
+        last = a
+    if edges:
+        print("  AC edges:")
+        for t, kind in edges:
+            arrow = "+++" if kind == "plug-in" else "---"
+            clr = OK_COLOR if kind == "plug-in" else WARN_COLOR
+            print(f"    {t}  {C(arrow, clr)}  {kind}")
+
+    # Biggest single-tick power swing on battery (w_sys).
+    big_swings = []
+    prev = None
+    for r in s.rows:
+        ws = r.get("w_sys")
+        if ws is None or r.get("ac") != 0:
+            prev = None
+            continue
+        if prev is not None and abs(ws - prev) > 5:
+            big_swings.append((r["_t"], prev, ws))
+        prev = ws
+    if big_swings:
+        big_swings.sort(key=lambda x: -abs(x[2] - x[1]))
+        print()
+        print("  largest 5 single-tick power swings on battery:")
+        for t, p, c in big_swings[:5]:
+            dw = c - p
+            clr = WARN_COLOR if dw > 0 else INFO_COLOR
+            print(f"    {t}  {p:6.2f}W -> {c:6.2f}W  "
+                  f"({C(f'{dw:+5.2f}W', clr)})")
+
+    # Longest discharge session.
+    if s.sessions:
+        longest = max(s.sessions, key=lambda x: len(x))
+        dur = (longest[-1]["_t"] - longest[0]["_t"]).total_seconds()
+        c0 = longest[0].get("cap")
+        c1 = longest[-1].get("cap")
+        print()
+        print(f"  longest discharge session:")
+        print(f"    {longest[0]['_t']} -> {longest[-1]['_t']}  "
+              f"({fmt_dur(dur)}, cap {c0}% -> {c1}%)")
+
+    # Daemon startup events from meta records
+    # (only when running >=2 starts in window)
+    # already covered in metadata section
+
+    # Cap_th changes.
+    cap_th_events = []
+    last = object()
+    for r in s.rows:
+        cth = r.get("cap_th")
+        if cth != last:
+            cap_th_events.append((r["_t"], cth))
+            last = cth
+    if len(cap_th_events) > 2:
+        print()
+        print("  charge cap changes:")
+        for t, cth in cap_th_events[-5:]:
+            lbl = ("detached" if cth is None
+                   else "no cap" if cth == 0
+                   else f"cap_th={cth}")
+            print(f"    {t}  {lbl}")
+
+
+# -----------------------------------------------------------------------------
+# Section registry. --section CLI accepts these names.
+# -----------------------------------------------------------------------------
+
+SECTIONS = [
+    ("metadata",     "Hardware / kernel header",
+        lambda s, meta: section_metadata(meta)),
+    ("range",        "Range + coverage + AC/mode split",
+        lambda s, _: section_header(s)),
+    ("tldr",         "Executive summary (TL;DR)",
+        lambda s, _: section_tldr(s)),
+    ("recs",         "Tuning recommendations",
+        lambda s, _: section_recommendations(s)),
+    ("residency",    "Tier residency overall/AC/battery",
+        lambda s, _: section_residency(s)),
+    ("ribbon",       "High-res tier ribbon (7.5min cells)",
+        lambda s, _: section_ribbon(s)),
+    ("timeline",     "Daily 24h timeline",
+        lambda s, _: section_timeline(s)),
+    ("hour",         "Hour-of-day tier pattern",
+        lambda s, _: section_hour_of_day(s)),
+    ("transitions",  "Transitions per hour + pair matrix",
+        lambda s, _: section_transitions(s)),
+    ("chatter",      "Chatter root-cause analysis",
+        lambda s, _: section_chatter(s)),
+    ("policy",       "Decision-table validation",
+        lambda s, _: section_policy(s)),
+    ("sensitivity",  "Threshold sensitivity analysis",
+        lambda s, _: section_threshold_sensitivity(s)),
+    ("load",         "Load distribution + percentiles",
+        lambda s, _: section_load_histogram(s)),
+    ("power",        "Power timeline per session",
+        lambda s, _: section_power_timeline(s)),
+    ("baseline",     "vs vendor baseline (Wh saved)",
+        lambda s, _: section_baseline(s)),
+    ("displays",     "Per-display power attribution",
+        lambda s, _: section_display_attribution(s)),
+    ("battery",      "Battery sessions + drain rate",
+        lambda s, _: section_battery(s)),
+    ("pending",      "Hold-timer effectiveness",
+        lambda s, _: section_pending(s)),
+    ("voltage",      "Battery voltage / OCV-SoC drift",
+        lambda s, _: section_battery_voltage(s)),
+    ("gauge",        "Battery gauge / wear (EC truth)",
+        lambda s, _: section_battery_gauge(s)),
+    ("drift",        "Platform drift (pp/epp/tccd vs expected)",
+        lambda s, _: section_platform_drift(s)),
+    ("thermal",      "Thermal per tier, idle vs load",
+        lambda s, _: section_thermal(s)),
+    ("calibration",  "Latency, pending, override stats",
+        lambda s, _: section_calibration(s)),
+    ("environment",  "Brightness, lid, charging_profile",
+        lambda s, _: section_environment(s)),
+    ("highlights",   "Notable events reel",
+        lambda s, _: section_highlights(s)),
+]
+
+# Group the sections under their big_section banners.
+GROUPS = [
+    ("HEADER",            ["metadata", "range"]),
+    ("HIGHLIGHTS",        ["tldr", "recs"]),
+    ("USAGE / TIER BEHAVIOR", [
+        "residency", "ribbon", "timeline", "hour", "transitions",
+        "chatter", "policy", "sensitivity",
+    ]),
+    ("LOAD / POWER",      ["load", "power", "baseline", "displays"]),
+    ("BATTERY",           ["battery", "pending", "voltage", "gauge"]),
+    ("PLATFORM",          ["drift", "thermal", "calibration", "environment"]),
+    ("EVENTS",            ["highlights"]),
+]
+
+
+def render(sections, summary, meta_rows):
+    by_name = {name: fn for name, _, fn in SECTIONS}
+    selected = set(sections) if sections else None
+    for group, names in GROUPS:
+        rendered_in_group = False
+        for nm in names:
+            if selected is not None and nm not in selected:
+                continue
+            if nm not in by_name:
+                continue
+            if not rendered_in_group:
+                big_section(group)
+                rendered_in_group = True
+            by_name[nm](summary, meta_rows)
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def main():
+    section_names = ", ".join(name for name, _, _ in SECTIONS)
+    ap = argparse.ArgumentParser(
+        description="Deep terminal report on powertux-autod JSONL logs.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  powertux-analyze                       # full report, all logs\n"
+               "  powertux-analyze --days 7              # last 7 days\n"
+               "  powertux-analyze --from 2026-05-12     # since a date\n"
+               "  powertux-analyze --section tldr,recs   # just the highlights\n"
+               "  powertux-analyze --ascii --no-color    # pipe-friendly\n"
+               f"\nsections (comma-separated for --section):\n  {section_names}\n",
+    )
+    ap.add_argument("--log-dir", type=Path,
+                    default=Path.home() / "Programs" / "powertux" / "log",
+                    help="directory of YYYY-MM-DD.jsonl files "
+                         "(default: ~/Programs/powertux/log)")
+    ap.add_argument("--from", dest="from_", metavar="ISO",
+                    help="lower bound (inclusive), e.g. 2026-05-12 or 2026-05-12T08:00")
+    ap.add_argument("--to", metavar="ISO",
+                    help="upper bound (exclusive)")
+    ap.add_argument("--days", type=int, metavar="N",
+                    help="restrict to the last N days from now")
+    ap.add_argument("--section", default=None,
+                    help="comma-separated section names to render (skip "
+                         "all others); see list in --help epilog")
+    ap.add_argument("--no-color", action="store_true",
+                    help="disable ANSI color (auto-disabled when stdout "
+                         "is a pipe)")
+    ap.add_argument("--ascii", action="store_true",
+                    help="ASCII chart chars instead of unicode blocks")
+    args = ap.parse_args()
+
+    global USE_COLOR, USE_UNICODE
+    USE_COLOR = not args.no_color and sys.stdout.isatty()
+    USE_UNICODE = not args.ascii
+
+    if not args.log_dir.is_dir():
+        print(f"log dir not found: {args.log_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    rows, meta_rows = load_rows(args)
+    if not rows:
+        print("(no log data in window)", file=sys.stderr)
+        sys.exit(1)
+
+    summary = Summary(rows)
+
+    sections = None
+    if args.section:
+        sections = [s.strip() for s in args.section.split(",") if s.strip()]
+        valid = {name for name, _, _ in SECTIONS}
+        bad = [s for s in sections if s not in valid]
+        if bad:
+            print(f"unknown section(s): {', '.join(bad)}", file=sys.stderr)
+            print(f"valid: {', '.join(sorted(valid))}", file=sys.stderr)
+            sys.exit(2)
+
+    render(sections, summary, meta_rows)
+    print()
+
+
+if __name__ == "__main__":
+    main()

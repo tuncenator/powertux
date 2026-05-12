@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""powertux-calibrate: sweep platform_profile x EPP and record power/perf/heat.
+
+Output:
+- <repo>/results/<timestamp>-calibration.json (repo resolved from this script's path)
+- a summary table on stdout
+
+Must run as root (writes platform_profile + EPP, reads RAPL).
+Stops tccd during the run so EPP writes stick.
+Restores original state on exit (including Ctrl-C).
+"""
+import datetime
+import glob
+import json
+import os
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CANDIDATES = [
+    # v3 probe: does boost=0 + EPP=performance create a clean middle tier?
+    {"name": "S-lp-BP-b0",   "pp": "low-power",   "epp": "balance_performance", "boost": 0},  # ref Silent (v2: 19.3W)
+    {"name": "M-lp-pf-b0",   "pp": "low-power",   "epp": "performance",         "boost": 0},  # NEW: predicted ~28-32W
+    {"name": "M-bal-pf-b0",  "pp": "balanced",    "epp": "performance",         "boost": 0},  # NEW variant
+    {"name": "B-perf-BP",    "pp": "performance", "epp": "balance_performance", "boost": 1},  # ref Balanced (v2: 47.7W)
+]
+
+PP_FILE = "/sys/firmware/acpi/platform_profile"
+EPP_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"
+FREQ_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+BOOST_FILE = "/sys/devices/system/cpu/cpufreq/boost"
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+
+SETTLE_SEC = 10
+IDLE_SEC = 20
+LOAD_SEC = 40
+RECOVER_SEC = 25
+
+
+def find_hwmon(target):
+    for h in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        try:
+            if (h / "name").read_text().strip() == target:
+                return h
+        except OSError:
+            continue
+    return None
+
+
+def find_rapl_package():
+    for d in sorted(Path("/sys/class/powercap").glob("intel-rapl:*")):
+        try:
+            if (d / "name").read_text().strip().startswith("package"):
+                return d / "energy_uj"
+        except OSError:
+            continue
+    return None
+
+
+def read_int(p):
+    return int(Path(p).read_text())
+
+
+def write_str(p, s):
+    Path(p).write_text(s)
+
+
+def apply_state(c):
+    write_str(PP_FILE, c["pp"])
+    for f in glob.glob(EPP_GLOB):
+        write_str(f, c["epp"])
+    write_str(BOOST_FILE, str(c["boost"]))
+
+
+def cpu_freq_avg_mhz():
+    vals = []
+    for f in glob.glob(FREQ_GLOB):
+        try:
+            vals.append(read_int(f))
+        except OSError:
+            pass
+    return statistics.mean(vals) / 1000.0 if vals else 0.0
+
+
+def sample(temp_file, rapl_file, duration):
+    freqs, temps, bat_w = [], [], []
+    try:
+        e0 = read_int(rapl_file)
+    except OSError:
+        e0 = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < duration:
+        freqs.append(cpu_freq_avg_mhz())
+        try:
+            temps.append(read_int(temp_file) / 1000.0)
+        except OSError:
+            pass
+        try:
+            p = read_int("/sys/class/power_supply/BAT0/power_now")
+            if p > 0:
+                bat_w.append(p / 1_000_000.0)
+        except (OSError, ValueError):
+            pass
+        time.sleep(1)
+    elapsed = time.monotonic() - t0
+    try:
+        e1 = read_int(rapl_file)
+        package_w = (e1 - e0) / 1_000_000.0 / elapsed if e0 is not None else None
+    except OSError:
+        package_w = None
+    return {
+        "duration_s": round(elapsed, 2),
+        "package_w": round(package_w, 2) if package_w is not None else None,
+        "freq_mhz_mean": round(statistics.mean(freqs), 0) if freqs else 0,
+        "freq_mhz_max": round(max(freqs), 0) if freqs else 0,
+        "temp_c_mean": round(statistics.mean(temps), 1) if temps else None,
+        "temp_c_max": round(max(temps), 1) if temps else None,
+        "bat_w_mean": round(statistics.mean(bat_w), 2) if bat_w else None,
+    }
+
+
+def run_7z_passes(passes):
+    proc = subprocess.Popen(
+        ["7z", "b", str(passes)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc
+
+
+def parse_7z_tot(text):
+    """Last 'Tot:' line in 7z b output has comp + decomp summary."""
+    last = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("Tot:"):
+            last = s
+    if not last:
+        return None
+    nums = []
+    for tok in last.split()[1:]:
+        try:
+            nums.append(int(tok))
+        except ValueError:
+            pass
+    return nums[-1] if nums else None
+
+
+def main():
+    if os.geteuid() != 0:
+        print("must run as root: sudo powertux-calibrate", file=sys.stderr)
+        sys.exit(1)
+
+    rapl = find_rapl_package()
+    if rapl is None:
+        print("no RAPL package counter; aborting", file=sys.stderr)
+        sys.exit(1)
+    k10 = find_hwmon("k10temp")
+    if k10 is None:
+        print("no k10temp hwmon; aborting", file=sys.stderr)
+        sys.exit(1)
+    temp_file = k10 / "temp1_input"
+
+    orig_pp = Path(PP_FILE).read_text().strip()
+    orig_epp = Path(glob.glob(EPP_GLOB)[0]).read_text().strip()
+    orig_boost = Path(BOOST_FILE).read_text().strip()
+    tccd_active = (
+        subprocess.run(
+            ["systemctl", "is-active", "--quiet", "tccd"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+    ac_online = "?"
+    try:
+        ac_online = Path("/sys/class/power_supply/AC0/online").read_text().strip()
+    except OSError:
+        pass
+
+    def restore():
+        print("\n  restoring platform_profile + EPP + boost...")
+        try:
+            write_str(PP_FILE, orig_pp)
+            for f in glob.glob(EPP_GLOB):
+                write_str(f, orig_epp)
+            write_str(BOOST_FILE, orig_boost)
+        except OSError as e:
+            print(f"  restore failed: {e}")
+        if tccd_active:
+            print("  restarting tccd")
+            subprocess.run(["systemctl", "start", "tccd"], check=False)
+
+    def on_signal(sig, frame):
+        print(f"\nsignal {sig} received; restoring and exiting")
+        restore()
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    total_per = SETTLE_SEC + IDLE_SEC + LOAD_SEC + RECOVER_SEC
+    print(f"powertux-calibrate; AC online={ac_online}; tccd_active={tccd_active}")
+    print(f"orig state: pp={orig_pp} epp={orig_epp} boost={orig_boost}")
+    print(f"candidates: {len(CANDIDATES)}; est. {len(CANDIDATES)*total_per}s total")
+    print("for cleanest data: close browsers/IDEs and let the desktop quiesce")
+    if tccd_active:
+        print("stopping tccd")
+        subprocess.run(["systemctl", "stop", "tccd"], check=True)
+
+    results = []
+    try:
+        for i, c in enumerate(CANDIDATES, 1):
+            print(f"\n[{i}/{len(CANDIDATES)}] {c['name']}: pp={c['pp']} epp={c['epp']} boost={c['boost']}")
+            apply_state(c)
+            time.sleep(SETTLE_SEC)
+            print(f"  idle sample ({IDLE_SEC}s)...")
+            idle = sample(temp_file, rapl, IDLE_SEC)
+            print(
+                f"    pkg={idle['package_w']}W  freq={idle['freq_mhz_mean']:.0f}MHz  "
+                f"temp={idle['temp_c_mean']}°C"
+            )
+            print(f"  load: 7z b 2 passes, sampling for {LOAD_SEC}s...")
+            proc = run_7z_passes(2)
+            load = sample(temp_file, rapl, LOAD_SEC)
+            try:
+                stdout, _ = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, _ = proc.communicate()
+            score = parse_7z_tot(stdout)
+            print(
+                f"    pkg={load['package_w']}W  freq={load['freq_mhz_mean']:.0f}MHz  "
+                f"temp_max={load['temp_c_max']}°C  7z_tot={score}"
+            )
+            results.append(
+                {
+                    "candidate": c,
+                    "idle": idle,
+                    "load": load,
+                    "score_7z_tot": score,
+                }
+            )
+            print(f"  recovery sleep {RECOVER_SEC}s")
+            time.sleep(RECOVER_SEC)
+    finally:
+        restore()
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    out_file = RESULTS_DIR / f"{ts}-calibration.json"
+    out_file.write_text(
+        json.dumps(
+            {
+                "timestamp": ts,
+                "ac_online": ac_online,
+                "host": os.uname().nodename,
+                "kernel": os.uname().release,
+                "results": results,
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    print(f"\nresults: {out_file}")
+
+    headers = ["candidate", "idle_W", "load_W", "freq_MHz", "temp_max", "7z_tot"]
+    rows = []
+    for r in results:
+        rows.append(
+            [
+                r["candidate"]["name"],
+                f"{r['idle']['package_w']}",
+                f"{r['load']['package_w']}",
+                f"{r['load']['freq_mhz_mean']:.0f}",
+                f"{r['load']['temp_c_max']}",
+                str(r["score_7z_tot"]) if r["score_7z_tot"] else "?",
+            ]
+        )
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    sep = "  "
+    print()
+    print(sep.join(h.rjust(widths[i]) for i, h in enumerate(headers)))
+    print(sep.join("-" * w for w in widths))
+    for r in rows:
+        print(sep.join(r[i].rjust(widths[i]) for i in range(len(headers))))
+
+
+if __name__ == "__main__":
+    main()

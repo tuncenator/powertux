@@ -1,0 +1,164 @@
+{
+  "timestamp": "2026-05-11-224101",
+  "ac_online": "1",
+  "host": "ARCHON",
+  "kernel": "6.18.26-1-MANJARO",
+  "results": [
+    {
+      "candidate": {
+        "name": "lp-pw",
+        "pp": "low-power",
+        "epp": "power"
+      },
+      "idle": {
+        "duration_s": 10.01,
+        "package_w": 19.8,
+        "freq_mhz_mean": 1935.0,
+        "freq_mhz_max": 2380.0,
+        "temp_c_mean": 64.7,
+        "temp_c_max": 77.2,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.07,
+        "package_w": 41.21,
+        "freq_mhz_mean": 2940.0,
+        "freq_mhz_max": 3743.0,
+        "temp_c_mean": 65.0,
+        "temp_c_max": 81.8,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 92680
+    },
+    {
+      "candidate": {
+        "name": "lp-bp",
+        "pp": "low-power",
+        "epp": "balance_power"
+      },
+      "idle": {
+        "duration_s": 10.01,
+        "package_w": 21.67,
+        "freq_mhz_mean": 2040.0,
+        "freq_mhz_max": 2919.0,
+        "temp_c_mean": 65.5,
+        "temp_c_max": 80.5,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.1,
+        "package_w": 45.01,
+        "freq_mhz_mean": 3117.0,
+        "freq_mhz_max": 3757.0,
+        "temp_c_mean": 69.8,
+        "temp_c_max": 81.8,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 99177
+    },
+    {
+      "candidate": {
+        "name": "bal-bp",
+        "pp": "balanced",
+        "epp": "balance_power"
+      },
+      "idle": {
+        "duration_s": 10.01,
+        "package_w": 11.93,
+        "freq_mhz_mean": 2044.0,
+        "freq_mhz_max": 2912.0,
+        "temp_c_mean": 58.9,
+        "temp_c_max": 69.0,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.08,
+        "package_w": 45.33,
+        "freq_mhz_mean": 3091.0,
+        "freq_mhz_max": 3726.0,
+        "temp_c_mean": 70.9,
+        "temp_c_max": 82.9,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 102138
+    },
+    {
+      "candidate": {
+        "name": "bal-BP",
+        "pp": "balanced",
+        "epp": "balance_performance"
+      },
+      "idle": {
+        "duration_s": 10.02,
+        "package_w": 8.62,
+        "freq_mhz_mean": 1651.0,
+        "freq_mhz_max": 2905.0,
+        "temp_c_mean": 53.3,
+        "temp_c_max": 64.6,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.09,
+        "package_w": 48.09,
+        "freq_mhz_mean": 3158.0,
+        "freq_mhz_max": 3838.0,
+        "temp_c_mean": 73.2,
+        "temp_c_max": 83.4,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 102887
+    },
+    {
+      "candidate": {
+        "name": "perf-BP",
+        "pp": "performance",
+        "epp": "balance_performance"
+      },
+      "idle": {
+        "duration_s": 10.01,
+        "package_w": 9.85,
+        "freq_mhz_mean": 1910.0,
+        "freq_mhz_max": 3241.0,
+        "temp_c_mean": 53.3,
+        "temp_c_max": 61.9,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.08,
+        "package_w": 47.44,
+        "freq_mhz_mean": 3139.0,
+        "freq_mhz_max": 3852.0,
+        "temp_c_mean": 73.0,
+        "temp_c_max": 81.2,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 104998
+    },
+    {
+      "candidate": {
+        "name": "perf-pf",
+        "pp": "performance",
+        "epp": "performance"
+      },
+      "idle": {
+        "duration_s": 10.01,
+        "package_w": 22.34,
+        "freq_mhz_mean": 2494.0,
+        "freq_mhz_max": 3869.0,
+        "temp_c_mean": 62.4,
+        "temp_c_max": 79.5,
+        "bat_w_mean": null
+      },
+      "load": {
+        "duration_s": 40.08,
+        "package_w": 64.45,
+        "freq_mhz_mean": 3622.0,
+        "freq_mhz_max": 3891.0,
+        "temp_c_mean": 82.9,
+        "temp_c_max": 88.9,
+        "bat_w_mean": null
+      },
+      "score_7z_tot": 116393
+    }
+  ]
+}

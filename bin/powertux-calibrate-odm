@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""powertux-calibrate-odm: probe TCC ODM profiles for additional power tiers.
+
+Approach:
+- Backup /etc/tcc/profiles
+- Inject temporary profiles with odmProfile.name populated
+- Restart tccd so it picks them up
+- For each candidate: write platform_profile directly, then SetTempProfileById
+  (tccd applies EPP + noTurbo + ODM + fan from the profile), measure
+- On exit (or Ctrl-C): restore /etc/tcc/profiles, restart tccd, restore kernel knobs
+
+Must run as root.
+"""
+import copy
+import datetime
+import glob
+import json
+import os
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROFILES_FILE = "/etc/tcc/profiles"
+PROFILES_BACKUP = "/tmp/powertux-tcc-profiles.backup.json"
+PP_FILE = "/sys/firmware/acpi/platform_profile"
+EPP_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"
+FREQ_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+BOOST_FILE = "/sys/devices/system/cpu/cpufreq/boost"
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+
+# pp is written directly (tccd doesn't manage platform_profile).
+# profile_spec contributes EPP + noTurbo + odm via injected TCC profile.
+CANDIDATES = [
+    {
+        "name": "ODM-none-perf-BP",
+        "pp": "performance",
+        "profile_spec": {
+            "id": "powertux-none-bp",
+            "cpu_epp": "balance_performance",
+            "cpu_noTurbo": False,
+            "odm": "",
+        },
+    },
+    {
+        "name": "ODM-pwsv-perf-BP",
+        "pp": "performance",
+        "profile_spec": {
+            "id": "powertux-pwsv-bp",
+            "cpu_epp": "balance_performance",
+            "cpu_noTurbo": False,
+            "odm": "power_save",
+        },
+    },
+    {
+        "name": "ODM-enth-perf-BP",
+        "pp": "performance",
+        "profile_spec": {
+            "id": "powertux-enth-bp",
+            "cpu_epp": "balance_performance",
+            "cpu_noTurbo": False,
+            "odm": "enthusiast",
+        },
+    },
+    {
+        "name": "ODM-ovrb-perf-pf",
+        "pp": "performance",
+        "profile_spec": {
+            "id": "powertux-ovrb-pf",
+            "cpu_epp": "performance",
+            "cpu_noTurbo": False,
+            "odm": "overboost",
+        },
+    },
+]
+
+SETTLE_SEC = 12
+IDLE_SEC = 15
+LOAD_SEC = 40
+RECOVER_SEC = 25
+
+
+def write_str(p, s):
+    Path(p).write_text(s)
+
+
+def read_int(p):
+    return int(Path(p).read_text())
+
+
+def find_hwmon(name):
+    for h in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        try:
+            if (h / "name").read_text().strip() == name:
+                return h
+        except OSError:
+            continue
+    return None
+
+
+def find_rapl_package():
+    for d in sorted(Path("/sys/class/powercap").glob("intel-rapl:*")):
+        try:
+            if (d / "name").read_text().strip().startswith("package"):
+                return d / "energy_uj"
+        except OSError:
+            continue
+    return None
+
+
+def cpu_freq_avg_mhz():
+    vals = []
+    for f in glob.glob(FREQ_GLOB):
+        try:
+            vals.append(read_int(f))
+        except OSError:
+            pass
+    return statistics.mean(vals) / 1000.0 if vals else 0.0
+
+
+def sample(temp_file, rapl_file, duration):
+    freqs, temps = [], []
+    try:
+        e0 = read_int(rapl_file)
+    except OSError:
+        e0 = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < duration:
+        freqs.append(cpu_freq_avg_mhz())
+        try:
+            temps.append(read_int(temp_file) / 1000.0)
+        except OSError:
+            pass
+        time.sleep(1)
+    elapsed = time.monotonic() - t0
+    try:
+        e1 = read_int(rapl_file)
+        package_w = (e1 - e0) / 1_000_000.0 / elapsed if e0 is not None else None
+    except OSError:
+        package_w = None
+    return {
+        "duration_s": round(elapsed, 2),
+        "package_w": round(package_w, 2) if package_w is not None else None,
+        "freq_mhz_mean": round(statistics.mean(freqs), 0) if freqs else 0,
+        "freq_mhz_max": round(max(freqs), 0) if freqs else 0,
+        "temp_c_mean": round(statistics.mean(temps), 1) if temps else None,
+        "temp_c_max": round(max(temps), 1) if temps else None,
+    }
+
+
+def run_7z_passes(passes):
+    return subprocess.Popen(
+        ["7z", "b", str(passes)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def parse_7z_tot(text):
+    last = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("Tot:"):
+            last = s
+    if not last:
+        return None
+    nums = []
+    for tok in last.split()[1:]:
+        try:
+            nums.append(int(tok))
+        except ValueError:
+            pass
+    return nums[-1] if nums else None
+
+
+def build_profile(spec, template):
+    p = copy.deepcopy(template)
+    p["id"] = spec["id"]
+    p["name"] = spec["id"]
+    p["description"] = "powertux ODM calibration (temporary)"
+    p["cpu"]["energyPerformancePreference"] = spec["cpu_epp"]
+    p["cpu"]["noTurbo"] = spec["cpu_noTurbo"]
+    p["odmProfile"] = {"name": spec["odm"]} if spec["odm"] else {}
+    return p
+
+
+def dbus_set_profile_by_id(profile_id):
+    return subprocess.run(
+        [
+            "busctl",
+            "call",
+            "com.tuxedocomputers.tccd",
+            "/com/tuxedocomputers/tccd",
+            "com.tuxedocomputers.tccd",
+            "SetTempProfileById",
+            "s",
+            profile_id,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def main():
+    if os.geteuid() != 0:
+        print("must run as root: sudo powertux-calibrate-odm", file=sys.stderr)
+        sys.exit(1)
+
+    rapl = find_rapl_package()
+    if rapl is None:
+        print("no RAPL", file=sys.stderr)
+        sys.exit(1)
+    k10 = find_hwmon("k10temp")
+    if k10 is None:
+        print("no k10temp", file=sys.stderr)
+        sys.exit(1)
+    temp_file = k10 / "temp1_input"
+
+    orig_pp = Path(PP_FILE).read_text().strip()
+    orig_epp = Path(glob.glob(EPP_GLOB)[0]).read_text().strip()
+    orig_boost = Path(BOOST_FILE).read_text().strip()
+
+    shutil.copy(PROFILES_FILE, PROFILES_BACKUP)
+    original_profiles = json.loads(Path(PROFILES_FILE).read_text())
+    if not original_profiles:
+        print("no existing TCC profiles to clone from", file=sys.stderr)
+        sys.exit(1)
+    template = original_profiles[0]
+
+    augmented = list(original_profiles)
+    for c in CANDIDATES:
+        augmented.append(build_profile(c["profile_spec"], template))
+
+    def restore():
+        print("\nrestoring...")
+        subprocess.run(
+            ["systemctl", "stop", "tccd"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            shutil.copy(PROFILES_BACKUP, PROFILES_FILE)
+        except OSError as e:
+            print(f"  restore profiles failed: {e}")
+        try:
+            write_str(PP_FILE, orig_pp)
+            for f in glob.glob(EPP_GLOB):
+                write_str(f, orig_epp)
+            write_str(BOOST_FILE, orig_boost)
+        except OSError as e:
+            print(f"  restore knobs failed: {e}")
+        subprocess.run(["systemctl", "start", "tccd"], check=False)
+
+    def on_signal(sig, frame):
+        print(f"\nsignal {sig}; restoring and exiting")
+        restore()
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    total_per = SETTLE_SEC + IDLE_SEC + LOAD_SEC + RECOVER_SEC
+    print(f"powertux-calibrate-odm; {len(CANDIDATES)} candidates; est. {len(CANDIDATES)*total_per}s total")
+    print(f"orig state: pp={orig_pp} epp={orig_epp} boost={orig_boost}")
+    print(f"backed up profiles to {PROFILES_BACKUP}")
+
+    Path(PROFILES_FILE).write_text(json.dumps(augmented, indent=2))
+    print("restarting tccd to load new profiles")
+    subprocess.run(["systemctl", "restart", "tccd"], check=True)
+    time.sleep(4)
+
+    results = []
+    try:
+        for i, c in enumerate(CANDIDATES, 1):
+            ps = c["profile_spec"]
+            print(
+                f"\n[{i}/{len(CANDIDATES)}] {c['name']}: pp={c['pp']} "
+                f"odm={ps['odm'] or 'none'} EPP={ps['cpu_epp']} noTurbo={ps['cpu_noTurbo']}"
+            )
+            write_str(PP_FILE, c["pp"])
+            r = dbus_set_profile_by_id(ps["id"])
+            if r.returncode != 0:
+                print(f"  D-Bus error: {r.stderr.strip()}; skipping")
+                continue
+            time.sleep(SETTLE_SEC)
+            actual_epp = Path(glob.glob(EPP_GLOB)[0]).read_text().strip()
+            actual_boost = Path(BOOST_FILE).read_text().strip()
+            print(f"  applied: EPP={actual_epp} boost={actual_boost}")
+            print(f"  idle {IDLE_SEC}s...")
+            idle = sample(temp_file, rapl, IDLE_SEC)
+            print(
+                f"    pkg={idle['package_w']}W  freq={idle['freq_mhz_mean']:.0f}MHz  "
+                f"temp={idle['temp_c_mean']}°C"
+            )
+            print(f"  load {LOAD_SEC}s...")
+            proc = run_7z_passes(2)
+            load = sample(temp_file, rapl, LOAD_SEC)
+            try:
+                stdout, _ = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, _ = proc.communicate()
+            score = parse_7z_tot(stdout)
+            print(
+                f"    pkg={load['package_w']}W  freq={load['freq_mhz_mean']:.0f}MHz  "
+                f"temp_max={load['temp_c_max']}°C  7z_tot={score}"
+            )
+            results.append(
+                {
+                    "candidate": c,
+                    "actual_epp": actual_epp,
+                    "actual_boost": actual_boost,
+                    "idle": idle,
+                    "load": load,
+                    "score_7z_tot": score,
+                }
+            )
+            print(f"  recover {RECOVER_SEC}s")
+            time.sleep(RECOVER_SEC)
+    finally:
+        restore()
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    out_file = RESULTS_DIR / f"{ts}-odm-calibration.json"
+    out_file.write_text(
+        json.dumps({"timestamp": ts, "results": results}, indent=2, default=str)
+    )
+    print(f"\nresults: {out_file}")
+
+    headers = ["candidate", "ODM", "EPP", "idle_W", "load_W", "load_MHz", "temp_max", "7z_tot"]
+    rows = []
+    for r in results:
+        c = r["candidate"]
+        rows.append(
+            [
+                c["name"],
+                c["profile_spec"]["odm"] or "none",
+                r["actual_epp"],
+                f"{r['idle']['package_w']}",
+                f"{r['load']['package_w']}",
+                f"{r['load']['freq_mhz_mean']:.0f}",
+                f"{r['load']['temp_c_max']}",
+                str(r["score_7z_tot"]) if r["score_7z_tot"] else "?",
+            ]
+        )
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    sep = "  "
+    print()
+    print(sep.join(h.rjust(widths[i]) for i, h in enumerate(headers)))
+    print(sep.join("-" * w for w in widths))
+    for r in rows:
+        print(sep.join(r[i].rjust(widths[i]) for i in range(len(headers))))
+
+
+if __name__ == "__main__":
+    main()

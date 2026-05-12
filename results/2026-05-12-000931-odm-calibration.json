@@ -1,0 +1,129 @@
+{
+  "timestamp": "2026-05-12-000931",
+  "results": [
+    {
+      "candidate": {
+        "name": "ODM-none-perf-BP",
+        "pp": "performance",
+        "profile_spec": {
+          "id": "powertux-none-bp",
+          "cpu_epp": "balance_performance",
+          "cpu_noTurbo": false,
+          "odm": ""
+        }
+      },
+      "actual_epp": "balance_performance",
+      "actual_boost": "1",
+      "idle": {
+        "duration_s": 15.02,
+        "package_w": 5.67,
+        "freq_mhz_mean": 1367.0,
+        "freq_mhz_max": 2059.0,
+        "temp_c_mean": 44.6,
+        "temp_c_max": 46.5
+      },
+      "load": {
+        "duration_s": 40.07,
+        "package_w": 46.87,
+        "freq_mhz_mean": 3083.0,
+        "freq_mhz_max": 3740.0,
+        "temp_c_mean": 68.0,
+        "temp_c_max": 79.6
+      },
+      "score_7z_tot": 111799
+    },
+    {
+      "candidate": {
+        "name": "ODM-pwsv-perf-BP",
+        "pp": "performance",
+        "profile_spec": {
+          "id": "powertux-pwsv-bp",
+          "cpu_epp": "balance_performance",
+          "cpu_noTurbo": false,
+          "odm": "power_save"
+        }
+      },
+      "actual_epp": "balance_performance",
+      "actual_boost": "1",
+      "idle": {
+        "duration_s": 15.02,
+        "package_w": 5.32,
+        "freq_mhz_mean": 1620.0,
+        "freq_mhz_max": 2715.0,
+        "temp_c_mean": 43.9,
+        "temp_c_max": 44.5
+      },
+      "load": {
+        "duration_s": 40.08,
+        "package_w": 24.96,
+        "freq_mhz_mean": 2616.0,
+        "freq_mhz_max": 3335.0,
+        "temp_c_mean": 55.5,
+        "temp_c_max": 58.0
+      },
+      "score_7z_tot": 93206
+    },
+    {
+      "candidate": {
+        "name": "ODM-enth-perf-BP",
+        "pp": "performance",
+        "profile_spec": {
+          "id": "powertux-enth-bp",
+          "cpu_epp": "balance_performance",
+          "cpu_noTurbo": false,
+          "odm": "enthusiast"
+        }
+      },
+      "actual_epp": "balance_performance",
+      "actual_boost": "1",
+      "idle": {
+        "duration_s": 15.03,
+        "package_w": 5.32,
+        "freq_mhz_mean": 1250.0,
+        "freq_mhz_max": 1821.0,
+        "temp_c_mean": 44.2,
+        "temp_c_max": 44.8
+      },
+      "load": {
+        "duration_s": 40.07,
+        "package_w": 40.82,
+        "freq_mhz_mean": 3126.0,
+        "freq_mhz_max": 3664.0,
+        "temp_c_mean": 65.4,
+        "temp_c_max": 72.8
+      },
+      "score_7z_tot": 111384
+    },
+    {
+      "candidate": {
+        "name": "ODM-ovrb-perf-pf",
+        "pp": "performance",
+        "profile_spec": {
+          "id": "powertux-ovrb-pf",
+          "cpu_epp": "performance",
+          "cpu_noTurbo": false,
+          "odm": "overboost"
+        }
+      },
+      "actual_epp": "performance",
+      "actual_boost": "1",
+      "idle": {
+        "duration_s": 15.02,
+        "package_w": 9.44,
+        "freq_mhz_mean": 1671.0,
+        "freq_mhz_max": 2954.0,
+        "temp_c_mean": 46.6,
+        "temp_c_max": 50.4
+      },
+      "load": {
+        "duration_s": 40.06,
+        "package_w": 64.26,
+        "freq_mhz_mean": 3506.0,
+        "freq_mhz_max": 3780.0,
+        "temp_c_mean": 78.2,
+        "temp_c_max": 86.1
+      },
+      "score_7z_tot": 120730
+    }
+  ]
+}

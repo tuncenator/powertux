@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+"""powertux-autod: adaptive power level daemon.
+
+Reads load average, AC state, battery capacity. Applies a level via
+sudo powertux-set when the target changes. Honors mode=pinned but still
+re-asserts the pinned level on cold start and on AC/battery edges (tccd
+flips its own profile on those edges, which clobbers ours).
+
+Cheap: procfs/sysfs reads only every 5s. Subprocess only on actual level
+changes. No busctl, no journal spam (one log line per applied change).
+
+State file: ~/.config/powertux/state.json
+  {"mode": "auto"}                       -- daemon picks level from load/AC/cap
+  {"mode": "pinned", "level": 1..4}      -- daemon holds this level, re-applies
+                                            on cold start and AC edges
+
+Telemetry per tick (JSONL). All BAT0 fields are null whenever BAT0 has
+been detached by the EC (auto-detach at SoC=100 on AC is observed on
+this board), so analyze must tolerate every battery field being None
+simultaneously.
+
+Startup record (once per daemon start):
+  {"meta": true, "t": ..., "host": ..., "kernel": ..., "cpu_model": ...,
+   "dmi_product_name", "dmi_board_name", "dmi_sys_vendor",
+   "dmi_bios_version", "charge_full_design", "voltage_min_design",
+   "battery_model"}
+analyze filters these out of per-tick stats and surfaces them in the
+report header so anomalies can be correlated with hardware identity.
+
+Per-tick (always-present):
+  t, mode, load1m, load5m, load15m, ac, cap (kernel %; defaults to 100
+  when BAT0 detached, so cross-check with v_bat or status),
+  cap_th (active charge threshold 0-100; null if BAT0 detached),
+  tte_s, current, target, pending,
+  w_pkg (CPU package W from RAPL Δ; null on first tick),
+  w_sys (full-system W from BAT0 V*I; only when status=Discharging and
+  current_now>0),
+  v_bat (pack voltage in V),
+  i_bat (pack current in A, sign per ACPI),
+  status (Charging | Discharging | Not charging | Full | Unknown | null),
+  charge_now (coulomb counter in uAh; can snap without current flow when
+  EC re-anchors),
+  charge_full (coulomb counter "full" reference in uAh; KNOWN-WRONG on
+  this board -- always reports design; use raw_xif2_mah for truth),
+  cycle_count (battery cycle count; KNOWN-WRONG on this board -- always
+  reports 0; use raw_cycles for truth),
+  raw_cycles (EC's actual cycle count from raw_cycle_count sysfs),
+  raw_xif1_mah (EC's design capacity in mAh, _BIF[1]),
+  raw_xif2_mah (EC's learned last-full capacity in mAh, _BIF[2]; ratio
+  to raw_xif1_mah is the EC-believed fraction of design),
+  pp (active platform_profile, e.g. "performance"),
+  epp (cpu0 energy_performance_preference),
+  boost (cpufreq/boost, 0 or 1),
+  tccd_id (tccd active profile id from busctl GetActiveProfileJSON;
+  used for drift detection and logged so post-hoc analysis can spot
+  any moments where tccd disagreed with our last_applied),
+  cpu_mhz (mean current frequency across all logical CPUs),
+  cpu_temp_c (k10temp Tctl),
+  gpu_temp_c (amdgpu edge),
+  brightness_pct (panel backlight % of max),
+  kbd_backlight_pct (keyboard backlight % of max),
+  displays_ext (count of connected non-internal/non-Writeback DRM connectors),
+  displays (sorted list of EDID-identified display IDs like
+    "DP-2:GWD-1161-ARZOPA"; lets analyze attribute power per display by
+    grouping ticks on the displays set and reading w_sys delta vs the
+    no-external baseline. Empty list when only the internal panel is
+    attached; null only on read failure),
+  pd_partner_max_w (sum of nameplate sink-capability max W across all
+    USB-PD partners currently sinking from us; the bus-powered display
+    ceiling. Real draw is in w_sys, this is just a sanity bound),
+  lid (open/closed),
+  charging_profile (stationary/balanced/high_capacity/null),
+  eta_empty_s, eta_full_s (autod's per-tick ETA predictions; bench
+    replays these).
+"""
+import datetime
+import glob
+import gzip
+import json
+import os
+import platform
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+POLL_SEC = 5
+DOWNGRADE_HOLD_SEC = 30
+UPGRADE_HOLD_SEC = 5  # 1 extra poll confirms a real load vs single-tick noise
+RAW_KEEP_DAYS = 7
+LOG_KEEP_DAYS = 90
+
+# ETA fields written each tick. eta_empty_s = OCV-derived remaining Wh divided
+# by rolling-mean w_sys over ETA_WINDOW_SEC; matches the widget's algorithm.
+# eta_full_s = kernel-ABI (charge_full - charge_now) / current_now during CC.
+# powertux-eta-bench replays both against actual time-to-end.
+ETA_WINDOW_SEC = 900
+ETA_MIN_SAMPLES = 6
+CELLS = 4
+V_NOM_CELL = 3.7
+# "Empty" for ETA purposes isn't OCV=0%; the system auto-suspends well
+# before that. Matches what Windows/macOS/upower do: target the practical
+# shutdown threshold, not electrochemical empty. Refine from bench data.
+ETA_EMPTY_FLOOR_PCT = 10
+OCV_SOC = [
+    (4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85),
+    (4.00, 80), (3.95, 75), (3.90, 70), (3.85, 60),
+    (3.80, 50), (3.75, 40), (3.70, 30), (3.65, 25),
+    (3.60, 20), (3.55, 15), (3.50, 10), (3.45, 5),
+    (3.40, 0),
+]
+STATE_FILE = Path.home() / ".config" / "powertux" / "state.json"
+LOG_DIR = Path.home() / "Programs" / "powertux" / "log"
+LOAD_FILE = "/proc/loadavg"
+AC_FILE = "/sys/class/power_supply/AC0/online"
+CAP_FILE = "/sys/class/power_supply/BAT0/capacity"
+TTE_FILE = "/sys/class/power_supply/BAT0/time_to_empty_now"
+BAT_VOLT_FILE = "/sys/class/power_supply/BAT0/voltage_now"
+BAT_CURR_FILE = "/sys/class/power_supply/BAT0/current_now"
+BAT_STATUS_FILE = "/sys/class/power_supply/BAT0/status"
+BAT_CAP_TH_FILE = "/sys/class/power_supply/BAT0/charge_control_end_threshold"
+BAT_CHARGE_NOW_FILE = "/sys/class/power_supply/BAT0/charge_now"
+BAT_CHARGE_FULL_FILE = "/sys/class/power_supply/BAT0/charge_full"
+BAT_CYCLE_COUNT_FILE = "/sys/class/power_supply/BAT0/cycle_count"
+BAT_FULL_DESIGN_FILE = "/sys/class/power_supply/BAT0/charge_full_design"
+BAT_VOLT_MIN_FILE = "/sys/class/power_supply/BAT0/voltage_min_design"
+BAT_MODEL_FILE = "/sys/class/power_supply/BAT0/model_name"
+# raw_* paths exposed by patched tuxedo-drivers; the kernel ABI lies on this
+# board (cycle_count=0, charge_full=design) so these are the truth source.
+# raw_xif1 = _BIF.DesignCapacity (mAh), raw_xif2 = _BIF.LastFullChargeCapacity
+# (mAh), per DSDT analysis. raw_cycle_count is direct from the EC.
+BAT_RAW_CYCLE_FILE = "/sys/class/power_supply/BAT0/raw_cycle_count"
+BAT_RAW_XIF1_FILE = "/sys/class/power_supply/BAT0/raw_xif1"
+BAT_RAW_XIF2_FILE = "/sys/class/power_supply/BAT0/raw_xif2"
+PP_FILE = "/sys/firmware/acpi/platform_profile"
+EPP_FILE = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+BOOST_FILE = "/sys/devices/system/cpu/cpufreq/boost"
+CPU_FREQ_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+HWMON_GLOB = "/sys/class/hwmon/hwmon*"
+DMI_DIR = "/sys/devices/virtual/dmi/id"
+RAPL_ENERGY_FILE = "/sys/class/powercap/intel-rapl:0/energy_uj"
+BACKLIGHT_GLOB = "/sys/class/backlight/*/brightness"
+KBD_LED_GLOB = "/sys/class/leds/*kbd_backlight*/brightness"
+DRM_STATUS_GLOB = "/sys/class/drm/card*-*/status"
+LID_STATE_GLOB = "/proc/acpi/button/lid/*/state"
+CHARGING_PROFILE_FILE = "/sys/devices/platform/tuxedo_keyboard/charging_profile/charging_profile"
+# USB-C / USB-PD partner sysfs. partner is the device on the OTHER end of
+# the cable, i.e. what we're sourcing power to (Arzopa, dock, etc.). When
+# the partner is sinking from us, its sink-capabilities advertise the
+# voltage/current PDOs it can pull. The single highest V*I is the
+# nameplate ceiling; real-time draw is lower and only visible empirically
+# in w_sys delta on attach/detach.
+TYPEC_PORT_GLOB = "/sys/class/typec/port*"
+SET_CMD = ["sudo", "/usr/local/sbin/powertux-set"]
+TCCD_ACTIVE_CMD = [
+    "busctl", "call",
+    "com.tuxedocomputers.tccd",
+    "/com/tuxedocomputers/tccd",
+    "com.tuxedocomputers.tccd",
+    "GetActiveProfileJSON",
+]
+TIER_TCCD_ID = {
+    1: "powertux-silent",
+    2: "powertux-quiet",
+    3: "powertux-balanced",
+    4: "powertux-perf",
+}
+
+
+def read_state():
+    """Return (mode, pinned_level). pinned_level is 1..4 or None."""
+    try:
+        d = json.loads(STATE_FILE.read_text())
+        mode = d.get("mode", "auto")
+        try:
+            level = int(d.get("level"))
+            if level not in (1, 2, 3, 4):
+                level = None
+        except (TypeError, ValueError):
+            level = None
+        return mode, level
+    except (OSError, json.JSONDecodeError):
+        return "auto", None
+
+
+def read_loadavg():
+    parts = Path(LOAD_FILE).read_text().split()
+    return float(parts[0]), float(parts[1]), float(parts[2])
+
+
+def read_int(path, default):
+    try:
+        return int(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def read_bat():
+    """Read raw battery telemetry. All fields independently optional;
+    any unreadable path yields None for that field.
+
+    Fields:
+      v_bat       voltage_now in V (pack)
+      i_bat       current_now in A (sign per ACPI: positive = discharge on
+                  many boards; some are inverted; just log raw)
+      cap_th      charge_control_end_threshold, int 0-100 (active cap)
+      status      Charging | Discharging | Not charging | Full | Unknown
+      charge_now  coulomb counter in uAh
+      charge_full coulomb counter "full" reference in uAh (changes on wear
+                  or on EC re-anchor; today's "% jump after cap removal"
+                  was charge_now snapping up while this stayed stable)
+      cycle_count integer wear indicator
+      w_sys       V*I when status==Discharging and i>0; else None
+
+    On this board (TUXEDO IBP14 Gen10 AMD) the EC physically detaches BAT0
+    from the system bus at SoC=100 on AC, so every field can simultaneously
+    be None. Caller logs the nulls; analyze detects detach periods as runs
+    of consecutive null v_bat.
+    """
+    out = {
+        "v_bat": None, "i_bat": None, "cap_th": None, "status": None,
+        "charge_now": None, "charge_full": None, "cycle_count": None,
+        "raw_cycles": None, "raw_xif1_mah": None, "raw_xif2_mah": None,
+        "w_sys": None,
+    }
+    try:
+        with open(BAT_VOLT_FILE) as f:
+            v = int(f.read())
+        out["v_bat"] = v / 1e6
+    except (OSError, ValueError):
+        v = None
+    try:
+        with open(BAT_CURR_FILE) as f:
+            i = int(f.read())
+        out["i_bat"] = i / 1e6
+    except (OSError, ValueError):
+        i = None
+    try:
+        with open(BAT_CAP_TH_FILE) as f:
+            out["cap_th"] = int(f.read())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(BAT_CHARGE_NOW_FILE) as f:
+            out["charge_now"] = int(f.read())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(BAT_CHARGE_FULL_FILE) as f:
+            out["charge_full"] = int(f.read())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(BAT_CYCLE_COUNT_FILE) as f:
+            out["cycle_count"] = int(f.read())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(BAT_RAW_CYCLE_FILE) as f:
+            out["raw_cycles"] = int(f.read())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(BAT_RAW_XIF1_FILE) as f:
+            out["raw_xif1_mah"] = int(f.read())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(BAT_RAW_XIF2_FILE) as f:
+            out["raw_xif2_mah"] = int(f.read())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(BAT_STATUS_FILE) as f:
+            status = f.read().strip()
+        out["status"] = status
+        if status == "Discharging" and v is not None and i is not None and i > 0:
+            out["w_sys"] = (v * i) / 1e12
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def find_hwmon(name):
+    """Resolve hwmon path by name. Cache once at startup; the kernel may
+    re-order hwmonN slots across boots but the names are stable."""
+    for h in sorted(glob.glob(HWMON_GLOB)):
+        try:
+            if Path(f"{h}/name").read_text().strip() == name:
+                return h
+        except OSError:
+            continue
+    return None
+
+
+def read_temp_c(hwmon_dir, sensor="temp1_input"):
+    if not hwmon_dir:
+        return None
+    try:
+        return int(Path(f"{hwmon_dir}/{sensor}").read_text()) / 1000
+    except (OSError, ValueError):
+        return None
+
+
+def read_cpu_mhz():
+    """Mean current frequency across all logical CPUs, in MHz."""
+    vs = []
+    for p in glob.glob(CPU_FREQ_GLOB):
+        try:
+            vs.append(int(Path(p).read_text()))
+        except (OSError, ValueError):
+            continue
+    if not vs:
+        return None
+    return sum(vs) / len(vs) / 1000
+
+
+def read_metadata():
+    """One-off snapshot at daemon startup. Captures board / kernel / CPU /
+    battery design constants so later analysis can correlate anomalies
+    with hardware identity and detect cross-boot resets."""
+    meta = {"meta": True, "t": datetime.datetime.now().isoformat(timespec="seconds")}
+    meta["host"] = platform.node()
+    meta["kernel"] = platform.release()
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                meta["cpu_model"] = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    for f in ("product_name", "board_name", "sys_vendor", "bios_version"):
+        v = read_text(f"{DMI_DIR}/{f}")
+        if v:
+            meta[f"dmi_{f}"] = v
+    for f, key in (
+        (BAT_FULL_DESIGN_FILE, "charge_full_design"),
+        (BAT_VOLT_MIN_FILE, "voltage_min_design"),
+        (BAT_MODEL_FILE, "battery_model"),
+    ):
+        v = read_text(f)
+        if v is not None:
+            try:
+                meta[key] = int(v)
+            except ValueError:
+                meta[key] = v
+    return meta
+
+
+def read_w_pkg(prev_e, prev_t):
+    """CPU-package W from RAPL energy_uj. Returns (w, new_e, new_t).
+
+    w is None on first tick (no prev), permission errors, or counter wrap.
+    Requires /sys/class/powercap/intel-rapl:0/energy_uj to be readable;
+    install.sh ships a tmpfiles rule that sets it 0444.
+    """
+    try:
+        with open(RAPL_ENERGY_FILE) as f:
+            e = int(f.read())
+    except (OSError, ValueError):
+        return None, prev_e, prev_t
+    now = time.monotonic()
+    if prev_e is None or prev_t is None:
+        return None, e, now
+    dt = now - prev_t
+    if dt <= 0:
+        return None, e, now
+    de = e - prev_e
+    if de < 0:
+        return None, e, now
+    return (de / dt) / 1e6, e, now
+
+
+def compute_target(load1m, load5m, load15m, ac, capacity):
+    """Return level 1-4 from inputs. Monotonic in load; tighter as cap drops.
+
+    L1 reserved for sustained idle (all three load windows < 1) or low-battery
+    deep-idle. Floor for normal interactive use is L2 so boost stays available.
+    """
+    sustained_idle = load1m < 1 and load5m < 1 and load15m < 1
+    if ac:
+        if load1m >= 8:
+            return 4
+        if load1m >= 2:
+            return 3
+        return 2
+    # battery
+    if capacity >= 60:
+        if load1m >= 8:
+            return 3
+        if sustained_idle:
+            return 1
+        return 2
+    if capacity >= 30:
+        if sustained_idle:
+            return 1
+        return 2
+    # < 30%
+    if load1m >= 2:
+        return 2
+    return 1
+
+
+def apply_level(level):
+    subprocess.run(SET_CMD + [str(level)], check=False, timeout=10)
+    subprocess.run(["pkill", "-SIGRTMIN+1", "waybar"], check=False)
+
+
+def read_tccd_active_id():
+    """Return tccd's active profile id (e.g., 'powertux-quiet') or None.
+
+    busctl GetActiveProfileJSON output shape: `s "<json string with \\"
+    escapes>"`. We extract just the id field with a regex to avoid the
+    json-string-inside-busctl-string-quoting dance.
+    """
+    try:
+        r = subprocess.run(
+            TCCD_ACTIVE_CMD, capture_output=True, text=True,
+            timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or not r.stdout:
+        return None
+    # busctl emits the JSON payload with each `"` escaped as `\"`, so the
+    # id field appears as `\"id\":\"<value>\"`. Match that literal pattern;
+    # value runs until the next escaped quote.
+    out = r.stdout
+    marker = '\\"id\\":\\"'
+    i = out.find(marker)
+    if i < 0:
+        return None
+    start = i + len(marker)
+    j = out.find('\\"', start)
+    if j < 0:
+        return None
+    return out[start:j]
+
+
+def log(msg):
+    print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] {msg}", flush=True)
+
+
+def log_tick(record):
+    """Append one JSONL line per tick to LOG_DIR/YYYY-MM-DD.jsonl. Cheap; ~50B/line."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        today = datetime.date.today().isoformat()
+        with (LOG_DIR / f"{today}.jsonl").open("a") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+def cleanup_old_logs():
+    """Rotate and prune jsonl logs. Called once per day.
+
+    Files older than RAW_KEEP_DAYS get gzipped (about 10x smaller, still
+    readable by `gzip.open` from analyze). Files older than LOG_KEEP_DAYS
+    are removed entirely regardless of suffix."""
+    try:
+        if not LOG_DIR.exists():
+            return
+        today = datetime.date.today()
+        gzip_cutoff = (today - datetime.timedelta(days=RAW_KEEP_DAYS)).isoformat()
+        delete_cutoff = (today - datetime.timedelta(days=LOG_KEEP_DAYS)).isoformat()
+        for p in LOG_DIR.iterdir():
+            if not p.is_file():
+                continue
+            name = p.name
+            if name.endswith(".jsonl.gz"):
+                stem = name[:-9]
+            elif name.endswith(".jsonl"):
+                stem = name[:-6]
+            else:
+                continue
+            if stem < delete_cutoff:
+                p.unlink()
+                continue
+            if stem < gzip_cutoff and name.endswith(".jsonl"):
+                gz_path = p.with_suffix(".jsonl.gz")
+                if gz_path.exists():
+                    p.unlink()
+                    continue
+                try:
+                    with p.open("rb") as src, gzip.open(gz_path, "wb") as dst:
+                        dst.writelines(src)
+                    p.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def read_pct_from_max(brightness_glob):
+    """Backlight brightness as percent of max. brightness_glob points at
+    the `/brightness` files; `max_brightness` sits next to each. Returns
+    None if no path matches or if max is zero."""
+    for bri_path in glob.glob(brightness_glob):
+        max_path = str(Path(bri_path).parent / "max_brightness")
+        try:
+            with open(bri_path) as f:
+                cur = int(f.read())
+            with open(max_path) as f:
+                mx = int(f.read())
+            if mx <= 0:
+                continue
+            return round(cur / mx * 100)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+# EDID parse cache; keyed by connector name. Re-parsed only when the
+# connector set changes (cheap edge detection via signature string).
+_EDID_CACHE = {}
+_LAST_CONNECTOR_SIG = None
+
+
+def _parse_edid(data):
+    """Return (pnp, product_hex, name) from raw EDID bytes, or None if
+    the data doesn't look like a valid EDID block.
+
+    Layout (EDID 1.x):
+      bytes 0..7   fixed header 00 ff ff ff ff ff ff 00
+      bytes 8..9   manufacturer (PNP) ID, big-endian 5-bits-per-letter
+      bytes 10..11 product code, little-endian
+      bytes 54..125  four 18-byte descriptor blocks; one with tag 0xFC at
+                     [3] is the monitor product name.
+    """
+    if len(data) < 128 or data[:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return None
+    b = (data[8] << 8) | data[9]
+    pnp = "".join(
+        chr(((b >> shift) & 0x1f) + ord("A") - 1) for shift in (10, 5, 0)
+    )
+    if not all("A" <= c <= "Z" for c in pnp):
+        return None
+    prod = data[10] | (data[11] << 8)
+    name = None
+    for off in (54, 72, 90, 108):
+        if off + 18 > len(data):
+            break
+        blk = data[off:off + 18]
+        # Descriptor header: 00 00 00 <tag> 00 <13 bytes>. Tag 0xFC = name.
+        if blk[0] == 0 and blk[1] == 0 and blk[2] == 0 and blk[3] == 0xFC:
+            raw = blk[5:18]
+            # Names are padded with 0x0a then 0x20; strip both.
+            cut = raw.find(b"\x0a")
+            if cut >= 0:
+                raw = raw[:cut]
+            try:
+                name = raw.decode("ascii").strip()
+            except UnicodeDecodeError:
+                name = None
+            break
+    return pnp, f"{prod:04x}", name
+
+
+def _connector_id(name, edid_info):
+    """Build a stable, log-friendly ID for one connector.
+
+    Format: `<connector>:<PNP>-<product>-<name>`. Falls back to
+    `<connector>:?` when EDID is missing/unparseable, so the connector
+    still gets a slot in the per-display attribution table without
+    pretending we know the model.
+    """
+    if edid_info is None:
+        return f"{name}:?"
+    pnp, prod, mon = edid_info
+    safe_name = (mon or "").replace(",", " ").replace(":", " ").strip()
+    return f"{name}:{pnp}-{prod}" + (f"-{safe_name}" if safe_name else "")
+
+
+def read_displays():
+    """Return (ext_count, sorted_ids). Internal panel (eDP*) and
+    virtual sinks (Writeback*) are excluded; only the displays the user
+    chose to plug in get an entry. IDs persist across attach/detach so
+    analyze can attribute power by set.
+
+    EDID parses are cached: parsing 256 bytes is cheap, but a hot tick
+    loop shouldn't pay for it when the connector list is steady.
+    """
+    global _LAST_CONNECTOR_SIG
+    try:
+        statuses = []
+        for p in glob.glob(DRM_STATUS_GLOB):
+            try:
+                with open(p) as f:
+                    st = f.read().strip()
+            except OSError:
+                continue
+            full = Path(p).parent.name
+            # Strip the `cardN-` prefix so analyze gets the conventional
+            # DP-2 / HDMI-A-1 / eDP-1 connector names. The card index
+            # isn't useful for attribution (it can flip across kernel
+            # versions) and clutters log IDs.
+            name = full.split("-", 1)[1] if "-" in full else full
+            if "eDP" in name or "Writeback" in name:
+                continue
+            statuses.append((name, st, p))
+        statuses.sort()
+        sig = "|".join(f"{n}={st}" for n, st, _ in statuses)
+        if sig != _LAST_CONNECTOR_SIG:
+            _LAST_CONNECTOR_SIG = sig
+            new_cache = {}
+            for name, st, status_path in statuses:
+                if st != "connected":
+                    continue
+                edid_path = str(Path(status_path).parent / "edid")
+                try:
+                    with open(edid_path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    data = b""
+                new_cache[name] = _parse_edid(data) if data else None
+            _EDID_CACHE.clear()
+            _EDID_CACHE.update(new_cache)
+        connected = [(n, st) for n, st, _ in statuses if st == "connected"]
+        ids = sorted(_connector_id(n, _EDID_CACHE.get(n)) for n, _ in connected)
+        return len(connected), ids
+    except OSError:
+        return None, None
+
+
+def read_pd_partners_max_w():
+    """Sum of nameplate sink-capability max W across all USB-C partners
+    that are currently SINKING power from us (so the partner is drawing
+    from the laptop, not the other way around -- i.e. it's not the
+    charger). One PDO = one V*I option; we take the highest V*I per
+    partner as that partner's nameplate ceiling, then sum.
+
+    This is a *ceiling*, not the live draw. Real draw shows up in w_sys.
+    None if no PD partner is sinking or sysfs is unreadable.
+    """
+    try:
+        total_w = 0.0
+        found_any = False
+        for port_dir in glob.glob(TYPEC_PORT_GLOB):
+            base = Path(port_dir)
+            if base.name.endswith("-partner") or base.name.endswith("-cable") \
+                    or "plug" in base.name:
+                continue
+            # The port's power_role string is bracketed for the active value:
+            # "[source] sink" means we're sourcing (partner is sinking).
+            try:
+                role = (base / "power_role").read_text().strip()
+            except OSError:
+                continue
+            if "[source]" not in role:
+                continue
+            partner_dir = base.parent / f"{base.name}-partner"
+            if not partner_dir.is_dir():
+                continue
+            cap_root = partner_dir / "usb_power_delivery" / "sink-capabilities"
+            if not cap_root.is_dir():
+                continue
+            best_w = 0.0
+            for pdo_dir in cap_root.iterdir():
+                if not pdo_dir.is_dir():
+                    continue
+                # Each PDO subdir is e.g. `1:fixed_supply`.
+                v_path = pdo_dir / "voltage"
+                i_path = pdo_dir / "operational_current"
+                if not (v_path.exists() and i_path.exists()):
+                    continue
+                try:
+                    v_mv = int(v_path.read_text().replace("mV", "").strip())
+                    i_ma = int(i_path.read_text().replace("mA", "").strip())
+                except (OSError, ValueError):
+                    continue
+                w = (v_mv / 1000.0) * (i_ma / 1000.0)
+                if w > best_w:
+                    best_w = w
+            if best_w > 0:
+                total_w += best_w
+                found_any = True
+        return round(total_w, 1) if found_any else None
+    except OSError:
+        return None
+
+
+def read_lid():
+    """Return "open" / "closed" / None. ACPI lid status file format is
+    `state:      open` or `state:      closed`; we split on whitespace
+    and read the last token."""
+    for p in glob.glob(LID_STATE_GLOB):
+        try:
+            with open(p) as f:
+                text = f.read()
+        except OSError:
+            continue
+        parts = text.strip().split()
+        if len(parts) >= 2:
+            v = parts[-1].lower()
+            if v in ("open", "closed"):
+                return v
+    return None
+
+
+def ocv_soc(v_cell):
+    if v_cell >= OCV_SOC[0][0]:
+        return 100.0
+    if v_cell <= OCV_SOC[-1][0]:
+        return 0.0
+    for (v_hi, s_hi), (v_lo, s_lo) in zip(OCV_SOC, OCV_SOC[1:]):
+        if v_lo <= v_cell <= v_hi:
+            frac = (v_cell - v_lo) / (v_hi - v_lo)
+            return s_lo + (s_hi - s_lo) * frac
+    return 0.0
+
+
+def compute_eta_empty_s(recent_w_sys, bat, now):
+    """Rolling-mean w_sys over the last ETA_WINDOW_SEC of discharge ticks
+    divided into OCV-derived remaining Wh. None if discharging-state
+    requirements aren't met (status, inputs, or sample count)."""
+    if bat.get("status") != "Discharging":
+        return None
+    v_bat = bat.get("v_bat")
+    mah = bat.get("raw_xif2_mah")
+    if v_bat is None or not mah:
+        return None
+    cutoff = now - datetime.timedelta(seconds=ETA_WINDOW_SEC)
+    samples = [w for (t, w) in recent_w_sys if t >= cutoff]
+    if len(samples) < ETA_MIN_SAMPLES:
+        return None
+    avg_w = sum(samples) / len(samples)
+    if avg_w <= 0:
+        return None
+    full_wh = mah * CELLS * V_NOM_CELL / 1000.0
+    v_cell = v_bat / CELLS
+    usable_pct = max(0.0, ocv_soc(v_cell) - ETA_EMPTY_FLOOR_PCT)
+    remaining_wh = full_wh * usable_pct / 100.0
+    return remaining_wh * 3600.0 / avg_w
+
+
+def compute_eta_full_s(bat):
+    """Kernel-ABI charging ETA. (charge_full - charge_now) / current_now.
+    Wrong during trickle tail on this board (current_now suppressed below
+    gauge floor) but right during CC, which dominates total charge time."""
+    if bat.get("status") != "Charging":
+        return None
+    cf = bat.get("charge_full")
+    cn = bat.get("charge_now")
+    i = bat.get("i_bat")
+    if cf is None or cn is None or i is None or i <= 0:
+        return None
+    if cf <= cn:
+        return 0.0
+    # cf/cn in uAh, i in A. (cf - cn) / 1e6 = Ah remaining. /i = hours. *3600 = s.
+    return (cf - cn) / 1e6 / i * 3600.0
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    log("powertux-autod starting")
+    log_tick(read_metadata())  # one-shot startup record (meta=true)
+    hwmon_cpu = find_hwmon("k10temp")
+    hwmon_gpu = find_hwmon("amdgpu")
+    log(f"hwmon: cpu={hwmon_cpu} gpu={hwmon_gpu}")
+    last_applied = None
+    pending_target = None
+    pending_since = 0.0
+    last_mode = None
+    last_cleanup_day = None
+    last_ac = None
+    prev_energy_uj = None
+    prev_energy_t = None
+    recent_w_sys = []  # (datetime, w_sys) tuples, pruned to ETA_WINDOW_SEC
+
+    while True:
+        try:
+            mode, pinned_level = read_state()
+            if mode != last_mode:
+                log(f"mode -> {mode}")
+                last_mode = mode
+                if mode == "auto":
+                    last_applied = None
+                    pending_target = None
+
+            load1m, load5m, load15m = read_loadavg()
+            ac = bool(read_int(AC_FILE, 1))
+            cap = read_int(CAP_FILE, 100)
+            tte_s = read_int(TTE_FILE, 0)
+            ac_edge = last_ac is not None and ac != last_ac
+            last_ac = ac
+
+            today = datetime.date.today()
+            if today != last_cleanup_day:
+                cleanup_old_logs()
+                last_cleanup_day = today
+
+            # Drift detection: confirm tccd is still on the profile we think
+            # we applied. Catches tccd restarts, late accept after our apply,
+            # external SetTempProfileById callers, anything that silently
+            # clobbers our temp profile while we sit idle in steady state.
+            tccd_id = read_tccd_active_id()
+            if last_applied in TIER_TCCD_ID:
+                expected_id = TIER_TCCD_ID[last_applied]
+                if tccd_id is not None and tccd_id != expected_id:
+                    log(f"drift: tccd={tccd_id} expected={expected_id}; reapply L{last_applied}")
+                    apply_level(last_applied)
+                    tccd_id = expected_id  # post-apply expectation; analyze can still see the drift via gaps
+
+            target = compute_target(load1m, load5m, load15m, ac, cap)
+
+            w_pkg, prev_energy_uj, prev_energy_t = read_w_pkg(prev_energy_uj, prev_energy_t)
+            bat = read_bat()
+            cpu_mhz = read_cpu_mhz()
+            cpu_temp_c = read_temp_c(hwmon_cpu)
+            gpu_temp_c = read_temp_c(hwmon_gpu)
+            pp = read_text(PP_FILE)
+            epp = read_text(EPP_FILE)
+            boost_raw = read_text(BOOST_FILE)
+            try:
+                boost = int(boost_raw) if boost_raw is not None else None
+            except ValueError:
+                boost = None
+
+            brightness_pct = read_pct_from_max(BACKLIGHT_GLOB)
+            kbd_backlight_pct = read_pct_from_max(KBD_LED_GLOB)
+            displays_ext, displays = read_displays()
+            pd_partner_max_w = read_pd_partners_max_w()
+            lid = read_lid()
+            charging_profile = read_text(CHARGING_PROFILE_FILE)
+
+            now = datetime.datetime.now()
+            if (bat["status"] == "Discharging" and bat["w_sys"] is not None
+                    and bat["w_sys"] > 0):
+                recent_w_sys.append((now, bat["w_sys"]))
+            eta_cutoff = now - datetime.timedelta(seconds=ETA_WINDOW_SEC)
+            recent_w_sys = [(t, w) for (t, w) in recent_w_sys if t >= eta_cutoff]
+            eta_empty_s = compute_eta_empty_s(recent_w_sys, bat, now)
+            eta_full_s = compute_eta_full_s(bat)
+
+            log_tick({
+                "t": now.isoformat(timespec="seconds"),
+                "mode": mode,
+                "load1m": round(load1m, 2),
+                "load5m": round(load5m, 2),
+                "load15m": round(load15m, 2),
+                "ac": int(ac),
+                "cap": cap,
+                "cap_th": bat["cap_th"],
+                "tte_s": tte_s,
+                "current": last_applied,
+                "target": target,
+                "pending": pending_target,
+                "w_pkg": round(w_pkg, 2) if w_pkg is not None else None,
+                "w_sys": round(bat["w_sys"], 2) if bat["w_sys"] is not None else None,
+                "v_bat": round(bat["v_bat"], 3) if bat["v_bat"] is not None else None,
+                "i_bat": round(bat["i_bat"], 3) if bat["i_bat"] is not None else None,
+                "status": bat["status"],
+                "charge_now": bat["charge_now"],
+                "charge_full": bat["charge_full"],
+                "cycle_count": bat["cycle_count"],
+                "raw_cycles": bat["raw_cycles"],
+                "raw_xif1_mah": bat["raw_xif1_mah"],
+                "raw_xif2_mah": bat["raw_xif2_mah"],
+                "pp": pp,
+                "epp": epp,
+                "boost": boost,
+                "tccd_id": tccd_id,
+                "cpu_mhz": round(cpu_mhz) if cpu_mhz is not None else None,
+                "cpu_temp_c": round(cpu_temp_c, 1) if cpu_temp_c is not None else None,
+                "gpu_temp_c": round(gpu_temp_c, 1) if gpu_temp_c is not None else None,
+                "brightness_pct": brightness_pct,
+                "kbd_backlight_pct": kbd_backlight_pct,
+                "displays_ext": displays_ext,
+                "displays": displays,
+                "pd_partner_max_w": pd_partner_max_w,
+                "lid": lid,
+                "charging_profile": charging_profile,
+                "eta_empty_s": round(eta_empty_s) if eta_empty_s is not None else None,
+                "eta_full_s": round(eta_full_s) if eta_full_s is not None else None,
+            })
+
+            if mode != "auto":
+                # Cold start: re-apply pinned level so we recover from tccd
+                # boot-default. Fall back to auto target if state predates the
+                # level field (legacy {"mode":"pinned"}).
+                if last_applied is None:
+                    boot_level = pinned_level if pinned_level else target
+                    apply_level(boot_level)
+                    if pinned_level:
+                        log(f"init pinned L{boot_level}")
+                    else:
+                        log(f"init pinned L{boot_level} (no level in state; bootstrap from auto)")
+                    last_applied = boot_level
+                # AC/battery edge: tccd flips its profile, clobbering ours.
+                # Re-assert the pinned level on the same tick.
+                elif ac_edge and pinned_level:
+                    apply_level(pinned_level)
+                    log(f"reassert pinned L{pinned_level} after AC edge (ac={int(ac)})")
+                    last_applied = pinned_level
+                time.sleep(POLL_SEC)
+                continue
+
+            now = time.monotonic()
+
+            if last_applied is None:
+                apply_level(target)
+                log(f"init L{target} (load1m={load1m:.2f} ac={int(ac)} cap={cap})")
+                last_applied = target
+                pending_target = None
+            elif target > last_applied:
+                if pending_target == target:
+                    held = now - pending_since
+                    if held >= UPGRADE_HOLD_SEC:
+                        apply_level(target)
+                        log(
+                            f"up L{last_applied}->L{target} after {held:.0f}s "
+                            f"(load1m={load1m:.2f} ac={int(ac)} cap={cap})"
+                        )
+                        last_applied = target
+                        pending_target = None
+                else:
+                    pending_target = target
+                    pending_since = now
+            elif target < last_applied:
+                if pending_target == target:
+                    held = now - pending_since
+                    if held >= DOWNGRADE_HOLD_SEC and load5m < 8:
+                        apply_level(target)
+                        log(
+                            f"down L{last_applied}->L{target} after {held:.0f}s "
+                            f"(load1m={load1m:.2f} load5m={load5m:.2f} ac={int(ac)} cap={cap})"
+                        )
+                        last_applied = target
+                        pending_target = None
+                else:
+                    pending_target = target
+                    pending_since = now
+            else:
+                pending_target = None
+        except Exception as e:
+            log(f"loop error: {e}")
+
+        time.sleep(POLL_SEC)
+
+
+if __name__ == "__main__":
+    main()

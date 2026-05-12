@@ -1,0 +1,114 @@
+#!/bin/sh
+# powertux-mode: print or set powertux daemon mode (auto/pinned), optionally
+# pinning to a specific level. Equivalent to clicking the waybar widget; runs
+# without a GUI, suitable for keybinds.
+#
+# Usage:
+#   powertux-mode                 print current mode (and pinned level)
+#   powertux-mode auto            switch to auto (daemon picks level)
+#   powertux-mode pinned          pin at the currently-applied level
+#   powertux-mode pinned N        pin at level N (1-4); also applies it
+#   powertux-mode toggle          flip auto <-> pinned
+#
+# State written to ~/.config/powertux/state.json.
+# Waybar refresh signal (SIGRTMIN+1) sent on every state change.
+
+set -eu
+
+state_dir="$HOME/.config/powertux"
+state_file="$state_dir/state.json"
+
+get_mode() {
+    python3 - <<PY 2>/dev/null || echo auto
+import json
+try:
+    print(json.load(open("$state_file")).get("mode", "auto"))
+except Exception:
+    print("auto")
+PY
+}
+
+get_level() {
+    python3 - <<PY 2>/dev/null || echo ""
+import json
+try:
+    d = json.load(open("$state_file"))
+    lvl = d.get("level")
+    print(lvl if lvl is not None else "")
+except Exception:
+    print("")
+PY
+}
+
+write_auto() {
+    mkdir -p "$state_dir"
+    printf '{"mode":"auto"}\n' > "$state_file"
+}
+
+write_pinned() {
+    mkdir -p "$state_dir"
+    printf '{"mode":"pinned","level":%s}\n' "$1" > "$state_file"
+}
+
+current_level() {
+    /usr/local/bin/powertux-current-level 2>/dev/null || echo 0
+}
+
+signal_waybar() {
+    pkill -SIGRTMIN+1 waybar 2>/dev/null || true
+}
+
+valid_level() {
+    case "$1" in 1|2|3|4) return 0 ;; *) return 1 ;; esac
+}
+
+cmd="${1:-show}"
+
+case "$cmd" in
+    ""|show)
+        m=$(get_mode); l=$(get_level)
+        if [ "$m" = "pinned" ]; then
+            printf 'mode=pinned level=%s\n' "${l:-?}"
+        else
+            printf 'mode=auto\n'
+        fi
+        ;;
+    auto)
+        write_auto
+        signal_waybar
+        ;;
+    pinned)
+        if [ $# -ge 2 ]; then
+            lvl="$2"
+            if ! valid_level "$lvl"; then
+                echo "invalid level: $lvl (use 1-4)" >&2; exit 2
+            fi
+            sudo /usr/local/sbin/powertux-set "$lvl"
+            write_pinned "$lvl"
+        else
+            lvl=$(current_level)
+            valid_level "$lvl" || lvl=2
+            write_pinned "$lvl"
+        fi
+        signal_waybar
+        ;;
+    toggle)
+        m=$(get_mode)
+        if [ "$m" = "auto" ]; then
+            lvl=$(current_level)
+            valid_level "$lvl" || lvl=2
+            write_pinned "$lvl"
+        else
+            write_auto
+        fi
+        signal_waybar
+        ;;
+    -h|--help|help)
+        sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        echo "unknown subcommand: $cmd" >&2
+        echo "try: powertux-mode {auto|pinned [N]|toggle|show}" >&2
+        exit 2
+        ;;
+esac

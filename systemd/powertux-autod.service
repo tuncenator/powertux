@@ -1,0 +1,16 @@
+[Unit]
+Description=powertux adaptive power level daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/powertux-autod
+Restart=on-failure
+RestartSec=10s
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
