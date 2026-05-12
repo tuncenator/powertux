@@ -4,7 +4,19 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/powertux-autod
+# /dev/tuxedo_io is mode 0660 root:tuxedo-io (set by install.sh + the udev
+# rule in systemd/powertux-tuxedo-io.rules). Wrap autod with `sg tuxedo-io`
+# so the daemon picks up the supplementary group without requiring the
+# systemd --user manager to be restarted (which in practice means relog).
+# `sg` is setuid root with CAP_SETGID and resolves group membership via
+# /etc/group at exec time, so it works in user services as soon as the
+# user has been added via `gpasswd -a $USER tuxedo-io`. No relog needed.
+#
+# Process chain: systemd --user -> /usr/bin/sg -> /bin/sh -c -> powertux-autod.
+# Each link execve's into the next (no extra forks), so the daemon PID
+# stays under systemd's supervision; Type=simple + Restart=on-failure work
+# correctly through the wrap.
+ExecStart=/usr/bin/sg tuxedo-io -c /usr/local/bin/powertux-autod
 Restart=on-failure
 RestartSec=10s
 Nice=10

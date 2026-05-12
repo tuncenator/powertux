@@ -62,7 +62,7 @@ do_install() {
     check_prereqs
     prime_sudo
 
-    bold "[1/7] installing system commands"
+    bold "[1/8] installing system commands"
     # The two /usr/local/sbin scripts are referenced by the sudoers
     # NOPASSWD drop-in. They MUST be real files (root-owned, 0755)
     # because a symlink would let anyone with write access to the
@@ -79,12 +79,12 @@ do_install() {
     sudo ln -sfn "$SCRIPT_DIR/bin/powertux-analyze"       /usr/local/bin/powertux-analyze
     sudo ln -sfn "$SCRIPT_DIR/bin/powertux-eta-bench"     /usr/local/bin/powertux-eta-bench
 
-    bold "[2/7] installing RAPL tmpfiles rule"
+    bold "[2/8] installing RAPL tmpfiles rule"
     sudo install -m 0644 -o root -g root "$SCRIPT_DIR/systemd/powertux.tmpfiles.conf" /etc/tmpfiles.d/powertux.conf
     sudo systemd-tmpfiles --create /etc/tmpfiles.d/powertux.conf || true
     note "energy_uj perms: $(stat -c '%a' /sys/class/powercap/intel-rapl:0/energy_uj 2>/dev/null || echo missing)"
 
-    bold "[3/7] installing sudoers drop-in"
+    bold "[3/8] installing sudoers drop-in"
     # Template __POWERTUX_USER__ -> invoking user so the NOPASSWD rule grants
     # passwordless powertux-set to the right account. SUDO_USER is set by sudo
     # when install.sh is run via sudo wrappers; fall back to $USER otherwise.
@@ -102,11 +102,45 @@ do_install() {
     fi
     note "sudoers OK (user=$target_user)"
 
-    bold "[4/7] installing TCC profiles"
+    bold "[4/8] granting fan-telemetry access (/dev/tuxedo_io)"
+    # autod reads fan PWM duty and fan-sensor temps via ioctls on
+    # /dev/tuxedo_io (default 0600 root). Create a dedicated `tuxedo-io`
+    # group, add the user, install a udev rule that sets the device to
+    # 0660 root:tuxedo-io, and apply the perms to the live node so the
+    # daemon does not need to wait for next boot. Membership grants the
+    # same write-ioctl capability as the kernel exposes; treat it as
+    # equivalent trust to the existing powertux-set NOPASSWD rule.
+    if ! getent group tuxedo-io >/dev/null 2>&1; then
+        sudo groupadd -r tuxedo-io
+        note "created group tuxedo-io"
+    fi
+    # systemd/powertux-autod.service wraps ExecStart with `sg tuxedo-io`,
+    # which picks up the group from /etc/group at exec time. No relog is
+    # needed: gpasswd -> daemon-reload -> restart is sufficient.
+    if ! id -nG "$target_user" | tr ' ' '\n' | grep -qx tuxedo-io; then
+        sudo gpasswd -a "$target_user" tuxedo-io >/dev/null
+        note "added $target_user to tuxedo-io (no relog needed; sg wrap in unit)"
+    fi
+    sudo install -m 0644 -o root -g root "$SCRIPT_DIR/systemd/powertux-tuxedo-io.rules" \
+        /etc/udev/rules.d/99-powertux-tuxedo-io.rules
+    sudo udevadm control --reload-rules
+    if [ -e /dev/tuxedo_io ]; then
+        # Trigger pulls the new udev attrs onto the existing node so the
+        # daemon can open it on the next restart without a reboot. We also
+        # belt-and-suspenders chgrp/chmod in case the udev trigger races.
+        sudo udevadm trigger --action=change /dev/tuxedo_io || true
+        sudo chgrp tuxedo-io /dev/tuxedo_io
+        sudo chmod 0660 /dev/tuxedo_io
+        note "/dev/tuxedo_io perms: $(stat -c '%U:%G %a' /dev/tuxedo_io)"
+    else
+        note "/dev/tuxedo_io not present (non-TUXEDO chassis or tuxedo_io module not loaded); skipping"
+    fi
+
+    bold "[5/8] installing TCC profiles"
     sudo /usr/local/sbin/powertux-install-profiles
     wait_for_tccd
 
-    bold "[5/7] installing waybar scripts"
+    bold "[6/8] installing waybar scripts"
     mkdir -p "$HOME/.config/waybar/scripts"
     # User-scope, so symlinks. Waybar re-execs the click handlers each
     # press, so edits in waybar/ take effect on next click.
@@ -115,7 +149,7 @@ do_install() {
     ln -sfn "$SCRIPT_DIR/waybar/powertux-down.sh"   "$HOME/.config/waybar/scripts/powertux-down.sh"
     ln -sfn "$SCRIPT_DIR/waybar/powertux-toggle.sh" "$HOME/.config/waybar/scripts/powertux-toggle.sh"
 
-    bold "[6/7] initializing state file"
+    bold "[7/8] initializing state file"
     mkdir -p "$HOME/.config/powertux"
     if [ ! -f "$HOME/.config/powertux/state.json" ]; then
         printf '{"mode":"auto"}\n' > "$HOME/.config/powertux/state.json"
@@ -124,7 +158,7 @@ do_install() {
         note "state.json exists; left untouched"
     fi
 
-    bold "[7/7] enabling autod user service"
+    bold "[8/8] enabling autod user service"
     mkdir -p "$HOME/.config/systemd/user"
     # Symlinked. systemd reads symlinked units fine; edits to
     # systemd/powertux-autod.service take effect on next daemon-reload.
@@ -165,15 +199,15 @@ do_install() {
 do_uninstall() {
     prime_sudo
 
-    bold "[1/7] stopping + disabling autod"
+    bold "[1/8] stopping + disabling autod"
     systemctl --user disable --now powertux-autod.service 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/powertux-autod.service"
     systemctl --user daemon-reload
 
-    bold "[2/7] removing RAPL tmpfiles rule (does not revert energy_uj perms until reboot)"
+    bold "[2/8] removing RAPL tmpfiles rule (does not revert energy_uj perms until reboot)"
     sudo rm -f /etc/tmpfiles.d/powertux.conf
 
-    bold "[3/7] removing TCC profiles (preserving /etc/tcc/profiles.bak-pre-powertux)"
+    bold "[3/8] removing TCC profiles (preserving /etc/tcc/profiles.bak-pre-powertux)"
     if [ -x /usr/local/sbin/powertux-install-profiles ]; then
         sudo /usr/local/sbin/powertux-install-profiles --remove
     else
@@ -181,10 +215,23 @@ do_uninstall() {
         note "manual: edit /etc/tcc/profiles and remove powertux-* entries, then restart tccd"
     fi
 
-    bold "[4/7] removing sudoers drop-in"
+    bold "[4/8] removing sudoers drop-in"
     sudo rm -f /etc/sudoers.d/powertux
 
-    bold "[5/7] removing system commands"
+    bold "[4b/8] removing /dev/tuxedo_io udev rule (keeping tuxedo-io group)"
+    # We don't drop the group or remove the user from it: the group may
+    # be in use by other tools, and removing membership requires a relog
+    # to take effect anyway. Removing the rule + reverting the live
+    # device perms is enough to revoke autod's read path.
+    sudo rm -f /etc/udev/rules.d/99-powertux-tuxedo-io.rules
+    sudo udevadm control --reload-rules
+    if [ -e /dev/tuxedo_io ]; then
+        sudo chgrp root /dev/tuxedo_io 2>/dev/null || true
+        sudo chmod 0600 /dev/tuxedo_io 2>/dev/null || true
+        note "/dev/tuxedo_io reverted to root:root 0600"
+    fi
+
+    bold "[5/8] removing system commands"
     sudo rm -f /usr/local/sbin/powertux-set
     sudo rm -f /usr/local/sbin/powertux-install-profiles
     sudo rm -f /usr/local/bin/powertux-current-level
@@ -193,13 +240,13 @@ do_uninstall() {
     sudo rm -f /usr/local/bin/powertux-analyze
     sudo rm -f /usr/local/bin/powertux-eta-bench
 
-    bold "[6/7] removing waybar scripts"
+    bold "[6/8] removing waybar scripts"
     rm -f "$HOME/.config/waybar/scripts/powertux.sh"
     rm -f "$HOME/.config/waybar/scripts/powertux-up.sh"
     rm -f "$HOME/.config/waybar/scripts/powertux-down.sh"
     rm -f "$HOME/.config/waybar/scripts/powertux-toggle.sh"
 
-    bold "[7/7] keeping user state"
+    bold "[7/8] keeping user state"
     note "kept: ~/.config/powertux/state.json"
     note "kept: /etc/tcc/profiles.bak-pre-powertux (original TCC profiles backup)"
 
@@ -248,6 +295,26 @@ do_status() {
         ok "NOPASSWD: /usr/local/sbin/powertux-set"
     else
         miss "NOPASSWD: /usr/local/sbin/powertux-set (clicks will prompt for password)"
+    fi
+
+    bold "tuxedo_io access:"
+    if [ ! -e /dev/tuxedo_io ]; then
+        miss "/dev/tuxedo_io not present (non-TUXEDO chassis or module not loaded)"
+    else
+        local tio_mode tio_group
+        tio_mode=$(stat -c '%a' /dev/tuxedo_io 2>/dev/null)
+        tio_group=$(stat -c '%G' /dev/tuxedo_io 2>/dev/null)
+        if [ -f /etc/udev/rules.d/99-powertux-tuxedo-io.rules ]; then ok "/etc/udev/rules.d/99-powertux-tuxedo-io.rules"; else miss "/etc/udev/rules.d/99-powertux-tuxedo-io.rules"; fi
+        if [ "$tio_group" = "tuxedo-io" ] && [ "$tio_mode" = "660" ]; then
+            ok "/dev/tuxedo_io perms: $tio_group $tio_mode"
+        else
+            miss "/dev/tuxedo_io perms: $tio_group $tio_mode (expected tuxedo-io 660)"
+        fi
+        if id -nG "$USER" | tr ' ' '\n' | grep -qx tuxedo-io; then
+            ok "user '$USER' is in tuxedo-io group"
+        else
+            miss "user '$USER' is NOT in tuxedo-io group (relog after install)"
+        fi
     fi
 
     bold "RAPL access:"

@@ -1,0 +1,10 @@
+# powertux: relax /dev/tuxedo_io perms so the user-scope autod can issue
+# the read-only fan ioctls (R_UW_FANSPEED, R_UW_FAN_TEMP, ...) without
+# sudo. Group `tuxedo-io` is created by install.sh and the invoking user
+# is added to it.
+#
+# The kernel ioctl dispatcher does not enforce direction, so any process
+# holding an fd to /dev/tuxedo_io can also issue write ioctls (fan
+# curves, mode bits). Treat membership in `tuxedo-io` as equivalent to
+# the existing powertux-set NOPASSWD trust grant.
+KERNEL=="tuxedo_io", GROUP="tuxedo-io", MODE="0660"

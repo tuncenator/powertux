@@ -70,10 +70,19 @@ Per-tick (always-present):
     ceiling. Real draw is in w_sys, this is just a sanity bound),
   lid (open/closed),
   charging_profile (stationary/balanced/high_capacity/null),
+  fan1_pwm_pct, fan2_pwm_pct (EC fan PWM duty 0-100; null on non-Uniwill
+    chassis, when the `tuxedo-io` group is not granted, or when fan2
+    has no sensor on this chassis. NB: PWM duty, NOT RPM -- the EC
+    does not expose tachometer on this board family),
+  fan1_temp_c, fan2_temp_c (EC fan-sensor temps in C; raw EC bytes at
+    0x043e and 0x044f. Tracks the heatsink region of each fan -- fan1
+    correlates with CPU package, fan2 with dGPU on multi-fan models),
   eta_empty_s, eta_full_s (autod's per-tick ETA predictions; bench
     replays these).
 """
+import ctypes
 import datetime
+import fcntl
 import glob
 import gzip
 import json
@@ -145,6 +154,19 @@ KBD_LED_GLOB = "/sys/class/leds/*kbd_backlight*/brightness"
 DRM_STATUS_GLOB = "/sys/class/drm/card*-*/status"
 LID_STATE_GLOB = "/proc/acpi/button/lid/*/state"
 CHARGING_PROFILE_FILE = "/sys/devices/platform/tuxedo_keyboard/charging_profile/charging_profile"
+# tuxedo_io char device: read-only ioctls for fan PWM duty and fan-sensor
+# temps. Direction=READ, size=sizeof(int32_t*)=8 on 64-bit, type=0xEF
+# (IOCTL_MAGIC=0xEC + MAGIC_READ_UW=3). NB02_FAN_SPEED_MAX=0xc8 (200) is
+# the scale used by Uniwill universal-EC-fan-control boards (IBP14/15 Gen10
+# AMD); on Clevo boards the scale is 0xff and these ioctls don't apply.
+# Reads fail silently to None on non-Uniwill boards / missing group access.
+TUXEDO_IO_DEV = "/dev/tuxedo_io"
+_IOR_INT_CMD = (2 << 30) | (8 << 16) | (0xEF << 8)
+IOCTL_FANSPEED  = _IOR_INT_CMD | 0x10  # EC[0x1804] -- fan 1 PWM raw byte
+IOCTL_FANSPEED2 = _IOR_INT_CMD | 0x11  # EC[0x1809] -- fan 2 PWM raw byte
+IOCTL_FAN_TEMP  = _IOR_INT_CMD | 0x12  # EC[0x043e] -- fan 1 sensor C
+IOCTL_FAN_TEMP2 = _IOR_INT_CMD | 0x13  # EC[0x044f] -- fan 2 sensor C
+FAN_SPEED_MAX = 200
 # USB-C / USB-PD partner sysfs. partner is the device on the OTHER end of
 # the cable, i.e. what we're sourcing power to (Arzopa, dock, etc.). When
 # the partner is sinking from us, its sink-capabilities advertise the
@@ -287,6 +309,45 @@ def read_text(path):
         return Path(path).read_text().strip()
     except OSError:
         return None
+
+
+def open_tuxedo_io():
+    """Open /dev/tuxedo_io for fan ioctls. Returns an fd or None.
+    None means the device is missing (non-TUXEDO chassis), the user is
+    not in the `tuxedo-io` group (udev rule not applied or relog
+    pending), or the kernel module is the wrong variant."""
+    try:
+        return open(TUXEDO_IO_DEV, "rb", buffering=0)
+    except OSError:
+        return None
+
+
+def fan_ioctl(fd, cmd):
+    """Issue a int32 read ioctl. Returns the raw int or None on failure."""
+    if fd is None:
+        return None
+    try:
+        buf = ctypes.c_int32(0)
+        fcntl.ioctl(fd, cmd, buf, True)
+        return buf.value
+    except OSError:
+        return None
+
+
+def fan_pct(raw):
+    """Convert raw PWM byte (0..NB02_FAN_SPEED_MAX) to 0..100 percent."""
+    if raw is None or raw < 0:
+        return None
+    pct = raw / FAN_SPEED_MAX * 100
+    return round(max(0.0, min(100.0, pct)), 1)
+
+
+def fan_temp(raw):
+    """Fan-sensor temp byte from EC (already C). 0 means no sensor on
+    this channel (e.g. fan2 on single-fan / iGPU-only chassis)."""
+    if raw is None or raw <= 0:
+        return None
+    return raw
 
 
 def find_hwmon(name):
@@ -767,6 +828,20 @@ def main():
     hwmon_cpu = find_hwmon("k10temp")
     hwmon_gpu = find_hwmon("amdgpu")
     log(f"hwmon: cpu={hwmon_cpu} gpu={hwmon_gpu}")
+    tuxedo_io_fd = open_tuxedo_io()
+    if tuxedo_io_fd is None:
+        log(f"tuxedo_io: {TUXEDO_IO_DEV} unreadable; fan telemetry disabled")
+    else:
+        # Sanity probe: R_UW_FANS_OFF_AVAILABLE is hardcoded to 1 in
+        # tuxedo-drivers. If it returns something else we don't have the
+        # expected ioctl shape; disable fan reads rather than log garbage.
+        sentinel = fan_ioctl(tuxedo_io_fd, _IOR_INT_CMD | 0x16)
+        if sentinel != 1:
+            log(f"tuxedo_io: sentinel returned {sentinel} != 1; fan telemetry disabled")
+            tuxedo_io_fd.close()
+            tuxedo_io_fd = None
+        else:
+            log(f"tuxedo_io: fd open, fan telemetry enabled")
     last_applied = None
     pending_target = None
     pending_since = 0.0
@@ -846,6 +921,10 @@ def main():
             pd_partner_max_w = read_pd_partners_max_w()
             lid = read_lid()
             charging_profile = read_text(CHARGING_PROFILE_FILE)
+            fan1_pwm_pct = fan_pct(fan_ioctl(tuxedo_io_fd, IOCTL_FANSPEED))
+            fan2_pwm_pct = fan_pct(fan_ioctl(tuxedo_io_fd, IOCTL_FANSPEED2))
+            fan1_temp_c = fan_temp(fan_ioctl(tuxedo_io_fd, IOCTL_FAN_TEMP))
+            fan2_temp_c = fan_temp(fan_ioctl(tuxedo_io_fd, IOCTL_FAN_TEMP2))
 
             now = datetime.datetime.now()
             if (bat["status"] == "Discharging" and bat["w_sys"] is not None
@@ -894,6 +973,10 @@ def main():
                 "pd_partner_max_w": pd_partner_max_w,
                 "lid": lid,
                 "charging_profile": charging_profile,
+                "fan1_pwm_pct": fan1_pwm_pct,
+                "fan2_pwm_pct": fan2_pwm_pct,
+                "fan1_temp_c": fan1_temp_c,
+                "fan2_temp_c": fan2_temp_c,
                 "eta_empty_s": round(eta_empty_s) if eta_empty_s is not None else None,
                 "eta_full_s": round(eta_full_s) if eta_full_s is not None else None,
             })

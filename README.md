@@ -21,9 +21,12 @@ range, and switches between them based on what you're actually doing.
 - **Waybar widget** with per-segment colored Pango markup. Click to pin /
   raise / lower the tier. Suffix `a` marks auto mode.
 - **CLI** (`powertux-mode`) for keybind-driven toggles, no GUI needed.
-- **JSONL telemetry** (one row per 5s tick) plus `powertux-analyze`, an
-  in-terminal report with residency / power-vs-vendor / per-display attribution
-  / battery sessions / threshold sensitivity / tuning recommendations.
+- **JSONL telemetry** (one row per 5s tick) including CPU/GPU temps, RAPL
+  package power, EC fan PWM duty + fan-sensor temps (via `/dev/tuxedo_io`
+  ioctl), per-display attribution data, and the active TCC profile. Pair
+  with `powertux-analyze`, an in-terminal report with residency /
+  power-vs-vendor / per-display attribution / battery sessions / threshold
+  sensitivity / tuning recommendations.
 - **ETA backtest harness** (`powertux-eta-bench`) that replays closed
   discharge segments against a panel of ETA algorithms (naive / median / ewma
   / blended / regression / tier-conditional) and ranks them by composite UX score.
@@ -107,6 +110,7 @@ that path is the easiest setup.
 | `/usr/local/bin/powertux-eta-bench` | ETA prediction backtest + oracle |
 | `/etc/sudoers.d/powertux` | NOPASSWD for powertux-set 1..4 |
 | `/etc/tmpfiles.d/powertux.conf` | relax RAPL `energy_uj` perms to 0444 |
+| `/etc/udev/rules.d/99-powertux-tuxedo-io.rules` | `/dev/tuxedo_io` -> 0660 root:tuxedo-io |
 | `~/.config/systemd/user/powertux-autod.service` | user service unit |
 | `~/.config/waybar/scripts/powertux*.sh` | waybar display + click handlers |
 | `~/.config/powertux/state.json` | mode flag (auto/pinned) |
@@ -114,6 +118,12 @@ that path is the easiest setup.
 Plus 4 entries appended to `/etc/tcc/profiles`:
 `powertux-silent`, `powertux-quiet`, `powertux-balanced`, `powertux-perf`.
 Original profiles backed up to `/etc/tcc/profiles.bak-pre-powertux`.
+
+The installer also creates the `tuxedo-io` system group and adds the
+invoking user. The autod service unit wraps its `ExecStart` in
+`sg tuxedo-io -c ...` so the group is in effect on the next daemon
+restart without requiring a logout/relog (which would otherwise be
+needed for the systemd `--user` manager to pick up the new group).
 
 Most user-scope files are symlinked; edits to the cloned repo take effect on
 the next invocation (the daemon needs `systemctl --user restart

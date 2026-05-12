@@ -145,6 +145,10 @@ compare against design.
 | `boost` | `/sys/devices/system/cpu/cpufreq/boost` | 0 or 1 | cpufreq boost enable | OK |
 | `tccd_id` | busctl `GetActiveProfileJSON` -> id | str | tccd's active profile id (e.g. "powertux-quiet") | OK |
 | `charging_profile` | `/sys/devices/platform/tuxedo_keyboard/charging_profile/charging_profile` | str | one of `stationary` / `balanced` / `high_capacity`; controls CV plateau height, charging current rate, and auto-detach trigger on this board. Independent of `tccd_id` (which is the powertux performance tier). | OK |
+| `fan1_pwm_pct` | ioctl `R_UW_FANSPEED` on `/dev/tuxedo_io` -> EC[0x1804] | float 0-100 | CPU-fan PWM duty cycle (NOT RPM; the EC does not expose tach on this board family). Raw EC byte scaled by `NB02_FAN_SPEED_MAX=200`. | OK; null when daemon couldn't open `/dev/tuxedo_io` (group `tuxedo-io` not granted, non-TUXEDO chassis, or `tuxedo_io` module not loaded) |
+| `fan2_pwm_pct` | ioctl `R_UW_FANSPEED2` -> EC[0x1809] | float 0-100 | GPU-fan PWM duty (or mirror of fan1 on single-fan chassis). | OK |
+| `fan1_temp_c` | ioctl `R_UW_FAN_TEMP` -> EC[0x043e] | int C | EC fan-sensor temp 1; tracks CPU heatsink region. Tends to track k10temp within a few degrees. | OK; null when sensor returns 0 (no sensor on this channel) or device unreadable |
+| `fan2_temp_c` | ioctl `R_UW_FAN_TEMP2` -> EC[0x044f] | int C | EC fan-sensor temp 2; populated on dGPU chassis, returns 0 (-> null) on iGPU-only chassis. | OK |
 
 `analyze` cross-checks each of these against the expected value for
 `current`:
@@ -192,6 +196,21 @@ on Strix Point regardless of tier).
 | `pd_partner_max_w` | `/sys/class/typec/portN-partner/usb_power_delivery/sink-capabilities/*` | W | sum of nameplate sink-capability max W across every USB-PD partner that is currently sinking from the laptop. This is the *ceiling* of what bus-powered devices may draw; live draw is in `w_sys`. Null when no PD partner is sinking. | OK as ceiling |
 | `lid` | `/proc/acpi/button/lid/*/state` | "open"/"closed" | ACPI lid switch state | OK |
 | `charging_profile` | `/sys/devices/platform/tuxedo_keyboard/charging_profile/charging_profile` | str | one of `stationary` / `balanced` / `high_capacity` | OK |
+
+### Fan telemetry
+
+| field | source | unit | what it is | trust |
+|---|---|---|---|---|
+| `fan1_pwm_pct` | ioctl `R_UW_FANSPEED` on `/dev/tuxedo_io` -> EC[0x1804], scaled by `NB02_FAN_SPEED_MAX=200` | % 0-100 | CPU fan PWM duty. NOT RPM; the EC does not expose tach on this board family (Uniwill universal-EC-fan-control). | OK |
+| `fan2_pwm_pct` | EC[0x1809] | % 0-100 | GPU fan PWM duty (dGPU models); mirrors fan1 or stays at 0 on single-fan chassis. | OK |
+| `fan1_temp_c` | EC[0x043e] | int C | Fan-sensor temp near CPU heatsink. Tracks k10temp within a few degrees. | OK |
+| `fan2_temp_c` | EC[0x044f] | int C | Fan-sensor temp near GPU heatsink. 0 -> null on iGPU-only chassis. | OK |
+
+All four are null when the daemon could not open `/dev/tuxedo_io` (user
+not yet in the `tuxedo-io` group, non-TUXEDO chassis, or kernel module
+not loaded). Install.sh handles the group + udev rule; a relog is
+required after first install for the systemd --user manager to pick up
+the new group membership.
 
 Per-display attribution: ticks are grouped by their `displays` set; the
 mean `w_sys` of each group minus the no-external baseline gives an
