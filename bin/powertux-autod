@@ -771,6 +771,7 @@ def main():
     pending_target = None
     pending_since = 0.0
     last_mode = None
+    last_pinned_level = None
     last_cleanup_day = None
     last_ac = None
     prev_energy_uj = None
@@ -780,11 +781,24 @@ def main():
     while True:
         try:
             mode, pinned_level = read_state()
-            if mode != last_mode:
-                log(f"mode -> {mode}")
+            mode_changed = mode != last_mode
+            pin_level_changed = mode == "pinned" and pinned_level != last_pinned_level
+            if mode_changed or pin_level_changed:
+                if mode_changed:
+                    log(f"mode -> {mode}" + (f" L{pinned_level}" if mode == "pinned" and pinned_level else ""))
+                else:
+                    log(f"pinned level -> L{pinned_level}")
                 last_mode = mode
+                last_pinned_level = pinned_level
                 if mode == "auto":
                     last_applied = None
+                    pending_target = None
+                elif pinned_level:
+                    # External action (waybar click or powertux-mode) already
+                    # called powertux-set with the new level. Sync last_applied
+                    # so the drift detector below doesn't see a phantom
+                    # mismatch and revert to the previous auto-chosen tier.
+                    last_applied = pinned_level
                     pending_target = None
 
             load1m, load5m, load15m = read_loadavg()
