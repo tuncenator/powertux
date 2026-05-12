@@ -1800,6 +1800,89 @@ def section_thermal(s):
               f"{n:>5d}")
 
 
+def section_fans(s):
+    """Per-tier fan PWM duty and fan-sensor temp (idle vs load split).
+
+    PWM is fan power (0-100 %), NOT RPM -- this board's EC does not
+    expose tachometer. The min-speed floor is 25 % (NB02_FAN_SPEED_MAX
+    * FAN_ON_MIN_SPEED_PERCENT / 100); samples clamped exactly at 25
+    are the EC's auto-curve at idle / cool, not "the fan is broken".
+
+    fan1 sensor sits near the CPU heatsink and tracks k10temp within
+    ~3-5 C; the cpu_dev column reports the median |fan1_temp - cpu_temp|
+    so heatsink-saturation episodes (sensor lags far behind k10temp on
+    sudden bursts) surface. fan2 on this iGPU chassis is null.
+    """
+    have = [r for r in s.rows if r.get("fan1_pwm_pct") is not None]
+    if not have:
+        return
+    section("Fan behavior (per tier, idle vs load split)")
+    by_lv = defaultdict(lambda: {
+        "pwm_idle": [], "pwm_load": [],
+        "ft_idle": [], "ft_load": [],
+        "dev_idle": [], "dev_load": [],
+    })
+    floor_hits = 0  # exact 25 % == FAN_ON_MIN_SPEED_PERCENT floor
+    pwm_max = 0
+    for r in have:
+        lv = r.get("current")
+        if lv not in (1, 2, 3, 4):
+            continue
+        bucket = "load" if (r.get("load1m") or 0) >= 1 else "idle"
+        pwm = r["fan1_pwm_pct"]
+        by_lv[lv][f"pwm_{bucket}"].append(pwm)
+        if pwm == 25.0:
+            floor_hits += 1
+        if pwm > pwm_max:
+            pwm_max = pwm
+        ft = r.get("fan1_temp_c")
+        ct = r.get("cpu_temp_c")
+        if ft is not None:
+            by_lv[lv][f"ft_{bucket}"].append(ft)
+            if ct is not None:
+                by_lv[lv][f"dev_{bucket}"].append(abs(ft - ct))
+
+    def med(xs):
+        return sorted(xs)[len(xs) // 2] if xs else None
+
+    print(f"  {'tier':6s}  {'PWM% idle':>10s}  {'PWM% load':>10s}  "
+          f"{'°C idle':>9s}  {'°C load':>9s}  {'|Δcpu|':>7s}  {'n':>6s}")
+    for lv in (1, 2, 3, 4):
+        d = by_lv.get(lv)
+        if not d:
+            continue
+        pi = med(d["pwm_idle"])
+        pl = med(d["pwm_load"])
+        ti = med(d["ft_idle"])
+        tl = med(d["ft_load"])
+        # Pool idle+load deviations; cpu_dev rarely varies by bucket.
+        dev = med(d["dev_idle"] + d["dev_load"])
+        n = len(d["pwm_idle"]) + len(d["pwm_load"])
+        fmt = lambda x, w, dec=1: (f"{x:.{dec}f}" if x is not None else "-").rjust(w)
+        print(f"  L{lv:<5d}  {fmt(pi, 10)}  {fmt(pl, 10)}  "
+              f"{fmt(ti, 9, 0)}  {fmt(tl, 9, 0)}  {fmt(dev, 7, 1)}  {n:>6d}")
+
+    total = sum(len(d["pwm_idle"]) + len(d["pwm_load"]) for d in by_lv.values())
+    if total:
+        floor_pct = 100.0 * floor_hits / total
+        print()
+        print(f"  fan PWM range:        {25.0:.0f} - {pwm_max:.0f} % "
+              f"(floor 25 % is FAN_ON_MIN_SPEED_PERCENT, not stall)")
+        print(f"  samples at floor:     {floor_hits:,} / {total:,} "
+              f"({floor_pct:.1f} %; expected high in L1/L2 at idle)")
+        # The |Δcpu| column is a cheap heatsink-saturation indicator.
+        # fan1 sensor is downstream of the heatpipe and lags k10temp on
+        # bursty loads; sustained deltas >10 C across multiple tiers
+        # suggest paste degradation or airflow obstruction.
+        worst_dev = max(
+            (med(d["dev_idle"] + d["dev_load"]) or 0) for d in by_lv.values()
+        )
+        if worst_dev >= 10:
+            print(f"  warning: worst-tier |fan_sensor - k10temp| median = "
+                  f"{worst_dev:.1f} °C; expected <=5 °C. Heatsink contact / "
+                  f"paste / airflow worth checking.")
+
+
 def section_calibration(s):
     section("Calibration health (auto mode only)")
     auto_rows = [r for r in s.rows if r.get("mode") == "auto"]
@@ -2115,6 +2198,8 @@ SECTIONS = [
         lambda s, _: section_platform_drift(s)),
     ("thermal",      "Thermal per tier, idle vs load",
         lambda s, _: section_thermal(s)),
+    ("fans",         "Fan PWM duty + fan-sensor temp per tier",
+        lambda s, _: section_fans(s)),
     ("calibration",  "Latency, pending, override stats",
         lambda s, _: section_calibration(s)),
     ("environment",  "Brightness, lid, charging_profile",
@@ -2133,7 +2218,7 @@ GROUPS = [
     ]),
     ("LOAD / POWER",      ["load", "power", "baseline", "displays"]),
     ("BATTERY",           ["battery", "pending", "voltage", "gauge"]),
-    ("PLATFORM",          ["drift", "thermal", "calibration", "environment"]),
+    ("PLATFORM",          ["drift", "thermal", "fans", "calibration", "environment"]),
     ("EVENTS",            ["highlights"]),
 ]
 

@@ -237,7 +237,7 @@ Report structure (each banner is a major group):
 | USAGE / TIER BEHAVIOR | residency, ribbon, daily timeline, hour-of-day, transitions, chatter, decision table, threshold sensitivity |
 | LOAD / POWER | load distribution, power timeline, vs vendor baseline, per-display power attribution |
 | BATTERY | sessions table, pending outcome, voltage/SoC, gauge/wear |
-| PLATFORM | drift, thermal, calibration health, environment context |
+| PLATFORM | drift, thermal, fans (PWM/temp per tier), calibration health, environment context |
 | EVENTS | highlights reel (AC edges, biggest swings, longest session, etc.) |
 
 The TL;DR + recommendations sections surface the load-bearing numbers and
