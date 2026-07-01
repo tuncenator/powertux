@@ -31,7 +31,7 @@ Per-tick (always-present):
   t, mode, load1m, load5m, load15m, ac, cap (kernel %; defaults to 100
   when BAT0 detached, so cross-check with v_bat or status),
   cap_th (active charge threshold 0-100; null if BAT0 detached),
-  tte_s, current, target, pending,
+  current, target, pending,
   w_pkg (CPU package W from RAPL Δ; null on first tick),
   w_sys (full-system W from BAT0 V*I; only when status=Discharging and
   current_now>0),
@@ -78,7 +78,14 @@ Per-tick (always-present):
     0x043e and 0x044f. Tracks the heatsink region of each fan -- fan1
     correlates with CPU package, fan2 with dGPU on multi-fan models),
   eta_empty_s, eta_full_s (autod's per-tick ETA predictions; bench
-    replays these).
+    replays these),
+  upower_w (upower's EnergyRate in W, derived from its own short-window
+    energy delta; differs from w_sys because upower includes ticks where
+    current_now reads zero by falling back to charge_now delta),
+  upower_eta_empty_s, upower_eta_full_s (upower's TimeToEmpty /
+    TimeToFull from the org.freedesktop.UPower.Device dbus interface;
+    null when state doesn't apply or gdbus call fails. Logged for
+    side-by-side comparison against our own predictor).
 """
 import ctypes
 import datetime
@@ -88,6 +95,7 @@ import gzip
 import json
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -95,23 +103,56 @@ import time
 from pathlib import Path
 
 POLL_SEC = 5
-DOWNGRADE_HOLD_SEC = 30
-UPGRADE_HOLD_SEC = 5  # 1 extra poll confirms a real load vs single-tick noise
+# 4-tick downgrade / 6-tick upgrade hold. Hysteresis on the L2/L3 boundary
+# (L2_TO_L3 / L3_TO_L2) does most of the chatter filtering; the hold catches
+# the remainder (single-tick spikes above 3.0, brief dips below 1.2).
+# Band widened 1.5/2.5 -> 1.2/3.0 and up-hold 20 -> 30 on 2026-07-01: 6 weeks
+# of data showed the 1.5/2.5 band still sat inside the load1m noise mass (30.6%
+# of ticks in [1.5, 2.5]) and chatter regressed to 47.9%. Backtest on the real
+# auto dataset: 1.2/3.0 -> ~23% sim chatter, ~45% fewer transitions/hr.
+DOWNGRADE_HOLD_SEC = 20
+UPGRADE_HOLD_SEC = 30
+L2_TO_L3 = 3.0
+L3_TO_L2 = 1.2
 RAW_KEEP_DAYS = 7
 LOG_KEEP_DAYS = 90
 
-# ETA fields written each tick. eta_empty_s = OCV-derived remaining Wh divided
-# by rolling-mean w_sys over ETA_WINDOW_SEC; matches the widget's algorithm.
-# eta_full_s = kernel-ABI (charge_full - charge_now) / current_now during CC.
-# powertux-eta-bench replays both against actual time-to-end.
+# ETA fields written each tick.
+# eta_empty_s = OCV-derived remaining Wh / TIER_W[current_tier], then
+#   EWMA-smoothed (ETA_EMPTY_EWMA_ALPHA). Tier-conditional baseline beats a
+#   rolling w_sys mean by 33% med abs; the EWMA cuts tick-to-tick jitter
+#   p90 7.9m -> 0.7m at no accuracy cost (per bin/powertux-eta-3way).
+# eta_full_s = remaining Wh to the charge target integrated over CHG_W_CURVE
+#   (SoC-conditioned charge power). kernel `cap` as SoC source.
+# bin/powertux-eta-backtest replays candidates against actual cycle endings;
+# bin/powertux-eta-compare scores logged-as-deployed vs upower;
+# bin/powertux-eta-3way compares default/current/v2 predictors.
 ETA_WINDOW_SEC = 900
 ETA_MIN_SAMPLES = 6
 CELLS = 4
 V_NOM_CELL = 3.7
+# Per-tier calibrated load-W from results/2026-05-12-000931-odm-calibration.json
+# and results/2026-05-11-232510-calibration.json (battery numbers). Used by
+# compute_eta_empty_s as the discharge-rate predictor in place of the prior
+# w_sys 15-min rolling mean. Re-derive after a recalibration run.
+TIER_W = {1: 19.0, 2: 25.0, 3: 41.0, 4: 64.0}
+TIER_W_FALLBACK = 25.0  # current_tier is None on cold start before auto applies
 # "Empty" for ETA purposes isn't OCV=0%; the system auto-suspends well
 # before that. Matches what Windows/macOS/upower do: target the practical
 # shutdown threshold, not electrochemical empty. Refine from bench data.
 ETA_EMPTY_FLOOR_PCT = 10
+# EWMA smoothing on the emitted discharge ETA. alpha=0.1 over 5s ticks is a
+# ~50s time constant, irrelevant at multi-hour horizons but enough to stop
+# the load-coupled jitter of the raw OCV-derived estimate.
+ETA_EMPTY_EWMA_ALPHA = 0.1
+# Charge-power curve: median pack charging power (v_bat*i_bat, W) by SoC
+# decile (0-9=0-9%, ..., 9=90-99%), from bin/powertux-eta-3way over 138 charge
+# segments (2026-07-01). CC ~32W to ~79%, then CV taper to 17W (80s) / 11W
+# (90s). Integrating remaining Wh over this beats a flat rolling mean near
+# full (4m vs 10m med err at cap>=70%, p90 tail 121m -> 85m). Robust because
+# the stationary profile rate-limits charging at the EC (charger-independent);
+# re-derive after a recalibration or if a faster default profile is adopted.
+CHG_W_CURVE = [32.0, 31.0, 30.0, 33.0, 31.0, 32.0, 33.0, 31.0, 17.0, 11.0]
 OCV_SOC = [
     (4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85),
     (4.00, 80), (3.95, 75), (3.90, 70), (3.85, 60),
@@ -124,7 +165,6 @@ LOG_DIR = Path.home() / "Programs" / "powertux" / "log"
 LOAD_FILE = "/proc/loadavg"
 AC_FILE = "/sys/class/power_supply/AC0/online"
 CAP_FILE = "/sys/class/power_supply/BAT0/capacity"
-TTE_FILE = "/sys/class/power_supply/BAT0/time_to_empty_now"
 BAT_VOLT_FILE = "/sys/class/power_supply/BAT0/voltage_now"
 BAT_CURR_FILE = "/sys/class/power_supply/BAT0/current_now"
 BAT_STATUS_FILE = "/sys/class/power_supply/BAT0/status"
@@ -181,6 +221,16 @@ TCCD_ACTIVE_CMD = [
     "/com/tuxedocomputers/tccd",
     "com.tuxedocomputers.tccd",
     "GetActiveProfileJSON",
+]
+# upower BAT0 properties via gdbus. Single GetAll call returns the full
+# property dict; cheaper than per-property Get calls (~4ms one-shot).
+# UPower DeviceState enum: 1=Charging, 2=Discharging, 4=Fully charged.
+UPOWER_GETALL_CMD = [
+    "gdbus", "call", "--system",
+    "--dest", "org.freedesktop.UPower",
+    "--object-path", "/org/freedesktop/UPower/devices/battery_BAT0",
+    "--method", "org.freedesktop.DBus.Properties.GetAll",
+    "org.freedesktop.UPower.Device",
 ]
 TIER_TCCD_ID = {
     1: "powertux-silent",
@@ -440,31 +490,44 @@ def read_w_pkg(prev_e, prev_t):
     return (de / dt) / 1e6, e, now
 
 
-def compute_target(load1m, load5m, load15m, ac, capacity):
-    """Return level 1-4 from inputs. Monotonic in load; tighter as cap drops.
+def compute_target(load1m, load5m, load15m, ac, capacity, current,
+                   lid, brightness_pct, displays_ext):
+    """Return level 1-4 from inputs.
 
-    L1 reserved for sustained idle (all three load windows < 1) or low-battery
-    deep-idle. Floor for normal interactive use is L2 so boost stays available.
+    L2/L3 hysteresis: up at load1m >= 3.0, down at < 1.2. The symmetric 2.0
+    threshold, then the 1.5/2.5 band, both sat inside the load1m noise mass
+    (30.6% of ticks in [1.5, 2.5]); 6 weeks of data still showed 47.9% chatter,
+    so the band was widened to 1.2/3.0 on 2026-07-01.
+
+    L1 fires on 'user not present' (lid closed with no externals, or panel
+    backlight at 0). The old 'load1m AND load5m AND load15m all < 1' gate
+    was unreachable with a browser open (0.3% L1 residency over 3d16h).
     """
-    sustained_idle = load1m < 1 and load5m < 1 and load15m < 1
+    user_absent = (
+        (lid == "closed" and (displays_ext or 0) == 0)
+        or (brightness_pct is not None and brightness_pct == 0)
+    )
+    # Hysteresis: hold above L3_TO_L2 once at L3+, otherwise need L2_TO_L3.
+    l23_thr = L3_TO_L2 if (current or 0) >= 3 else L2_TO_L3
+
     if ac:
         if load1m >= 8:
             return 4
-        if load1m >= 2:
+        if load1m >= l23_thr:
             return 3
-        return 2
+        return 2  # AC floor stays L2 (no L1 benefit on AC)
     # battery
     if capacity >= 60:
         if load1m >= 8:
             return 3
-        if sustained_idle:
+        if user_absent:
             return 1
         return 2
     if capacity >= 30:
-        if sustained_idle:
+        if user_absent:
             return 1
         return 2
-    # < 30%
+    # < 30%: tight rail, no hysteresis, load alone decides
     if load1m >= 2:
         return 2
     return 1
@@ -503,6 +566,58 @@ def read_tccd_active_id():
     if j < 0:
         return None
     return out[start:j]
+
+
+_UPOWER_INT_RE = re.compile(r"'([A-Za-z]+)':\s*<(?:int64|uint32|uint64)\s+(-?\d+)>")
+_UPOWER_FLOAT_RE = re.compile(r"'([A-Za-z]+)':\s*<(-?\d+\.\d+(?:e[+-]?\d+)?)>")
+
+
+def read_upower():
+    """Query upower's view of BAT0 via gdbus. Returns dict with keys
+    `state`, `w`, `eta_empty_s`, `eta_full_s`. All None on subprocess
+    failure or when the corresponding upower property isn't set.
+
+    upower's TimeToEmpty / TimeToFull are kept by its own short-window
+    rate history; useful as a second opinion against our 15-min w_sys
+    rolling-mean predictor, especially when current_now is suppressed.
+    Loggable side-by-side for offline comparison without re-fetching."""
+    out = {"state": None, "w": None, "eta_empty_s": None, "eta_full_s": None}
+    try:
+        r = subprocess.run(
+            UPOWER_GETALL_CMD, capture_output=True, text=True,
+            timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return out
+    if r.returncode != 0 or not r.stdout:
+        return out
+    s = r.stdout
+    ints = dict(_UPOWER_INT_RE.findall(s))
+    floats = dict(_UPOWER_FLOAT_RE.findall(s))
+    try:
+        out["state"] = int(ints["State"])
+    except (KeyError, ValueError):
+        pass
+    try:
+        out["w"] = float(floats["EnergyRate"])
+    except (KeyError, ValueError):
+        pass
+    # upower reports 0 for TimeToEmpty / TimeToFull when the field doesn't
+    # apply (i.e. the wrong state, or not enough rate history yet). Filter
+    # by state and treat 0 as null to match our own None-when-undefined
+    # convention.
+    try:
+        tte = int(ints["TimeToEmpty"])
+        if out["state"] == 2 and tte > 0:
+            out["eta_empty_s"] = tte
+    except (KeyError, ValueError):
+        pass
+    try:
+        ttf = int(ints["TimeToFull"])
+        if out["state"] == 1 and ttf > 0:
+            out["eta_full_s"] = ttf
+    except (KeyError, ValueError):
+        pass
+    return out
 
 
 def log(msg):
@@ -778,45 +893,75 @@ def ocv_soc(v_cell):
     return 0.0
 
 
-def compute_eta_empty_s(recent_w_sys, bat, now):
-    """Rolling-mean w_sys over the last ETA_WINDOW_SEC of discharge ticks
-    divided into OCV-derived remaining Wh. None if discharging-state
-    requirements aren't met (status, inputs, or sample count)."""
+def compute_eta_empty_s(bat, current_tier):
+    """Tier-conditional ETA: remaining_wh / TIER_W[current_tier].
+
+    Beats the prior 15-min w_sys rolling mean by 33% med abs / 54% p90 /
+    kills the multi-hour outliers (per bin/powertux-eta-backtest, 26
+    closed segments). Rationale: within a tier, load swings average
+    out over the discharge timescale; the rolling 15-min window catches
+    noise (an agent run, a build burst) that doesn't predict the next
+    2+ hours. The tier identity is the more stable signal.
+
+    Falls back to charge_full (uAh) when raw_xif2_mah is unreadable, so
+    we keep emitting ETAs across raw_xif2 sysfs hiccups (one such gap
+    cost us all 1551 ticks of the 2026-05-21 main segment with the
+    rolling-mean implementation)."""
     if bat.get("status") != "Discharging":
         return None
     v_bat = bat.get("v_bat")
+    if v_bat is None:
+        return None
     mah = bat.get("raw_xif2_mah")
-    if v_bat is None or not mah:
-        return None
-    cutoff = now - datetime.timedelta(seconds=ETA_WINDOW_SEC)
-    samples = [w for (t, w) in recent_w_sys if t >= cutoff]
-    if len(samples) < ETA_MIN_SAMPLES:
-        return None
-    avg_w = sum(samples) / len(samples)
-    if avg_w <= 0:
-        return None
+    if not mah:
+        cf = bat.get("charge_full")
+        if cf is None:
+            return None
+        mah = cf / 1000.0
+    w = TIER_W.get(current_tier, TIER_W_FALLBACK)
     full_wh = mah * CELLS * V_NOM_CELL / 1000.0
     v_cell = v_bat / CELLS
     usable_pct = max(0.0, ocv_soc(v_cell) - ETA_EMPTY_FLOOR_PCT)
     remaining_wh = full_wh * usable_pct / 100.0
-    return remaining_wh * 3600.0 / avg_w
+    if remaining_wh <= 0:
+        return 0.0
+    return remaining_wh * 3600.0 / w
 
 
-def compute_eta_full_s(bat):
-    """Kernel-ABI charging ETA. (charge_full - charge_now) / current_now.
-    Wrong during trickle tail on this board (current_now suppressed below
-    gauge floor) but right during CC, which dominates total charge time."""
+def compute_eta_full_s(bat, cap):
+    """SoC-conditioned charge ETA: integrate remaining Wh from `cap` to the
+    charge target over CHG_W_CURVE (median pack charging power per SoC decile).
+
+    Replaces the 15-min v*i rolling mean, which kept applying CC-stage watts
+    after the current had tapered and so under-estimated time near full. The
+    curve knows charging power drops to ~11-17W above 80%: 4m vs 10m med err
+    in the cap>=70% taper region and p90 tail 121m -> 85m (bin/powertux-eta-
+    3way). kernel `cap` is the SoC source (charge_now snaps on EC re-anchor).
+    cap_th (charge limit) is the target when set, else 100."""
     if bat.get("status") != "Charging":
         return None
-    cf = bat.get("charge_full")
-    cn = bat.get("charge_now")
-    i = bat.get("i_bat")
-    if cf is None or cn is None or i is None or i <= 0:
+    if cap is None:
         return None
-    if cf <= cn:
+    mah = bat.get("raw_xif2_mah")
+    if not mah:
+        cf = bat.get("charge_full")
+        if cf is None:
+            return None
+        mah = cf / 1000.0
+    cap_th = bat.get("cap_th")
+    target = cap_th if (cap_th and 0 < cap_th <= 100) else 100
+    if cap >= target:
         return 0.0
-    # cf/cn in uAh, i in A. (cf - cn) / 1e6 = Ah remaining. /i = hours. *3600 = s.
-    return (cf - cn) / 1e6 / i * 3600.0
+    full_wh = mah * CELLS * V_NOM_CELL / 1000.0
+    wh_per_pct = full_wh / 100.0
+    secs = 0.0
+    c = float(cap)
+    while c < target:
+        step = min(1.0, target - c)
+        w = CHG_W_CURVE[min(9, int(c) // 10)]
+        secs += wh_per_pct * step / w * 3600.0
+        c += step
+    return secs
 
 
 def main():
@@ -851,7 +996,8 @@ def main():
     last_ac = None
     prev_energy_uj = None
     prev_energy_t = None
-    recent_w_sys = []  # (datetime, w_sys) tuples, pruned to ETA_WINDOW_SEC
+    eta_empty_ewma = None   # EWMA state for the emitted discharge ETA
+    eta_empty_prev_t = None  # last tick time, to reset EWMA across gaps
 
     while True:
         try:
@@ -879,7 +1025,6 @@ def main():
             load1m, load5m, load15m = read_loadavg()
             ac = bool(read_int(AC_FILE, 1))
             cap = read_int(CAP_FILE, 100)
-            tte_s = read_int(TTE_FILE, 0)
             ac_edge = last_ac is not None and ac != last_ac
             last_ac = ac
 
@@ -900,7 +1045,16 @@ def main():
                     apply_level(last_applied)
                     tccd_id = expected_id  # post-apply expectation; analyze can still see the drift via gaps
 
-            target = compute_target(load1m, load5m, load15m, ac, cap)
+            # Read presence signals before compute_target (L1 trigger uses
+            # lid / brightness / displays_ext).
+            brightness_pct = read_pct_from_max(BACKLIGHT_GLOB)
+            kbd_backlight_pct = read_pct_from_max(KBD_LED_GLOB)
+            displays_ext, displays = read_displays()
+            lid = read_lid()
+
+            target = compute_target(load1m, load5m, load15m, ac, cap,
+                                    last_applied, lid, brightness_pct,
+                                    displays_ext)
 
             w_pkg, prev_energy_uj, prev_energy_t = read_w_pkg(prev_energy_uj, prev_energy_t)
             bat = read_bat()
@@ -915,11 +1069,7 @@ def main():
             except ValueError:
                 boost = None
 
-            brightness_pct = read_pct_from_max(BACKLIGHT_GLOB)
-            kbd_backlight_pct = read_pct_from_max(KBD_LED_GLOB)
-            displays_ext, displays = read_displays()
             pd_partner_max_w = read_pd_partners_max_w()
-            lid = read_lid()
             charging_profile = read_text(CHARGING_PROFILE_FILE)
             fan1_pwm_pct = fan_pct(fan_ioctl(tuxedo_io_fd, IOCTL_FANSPEED))
             fan2_pwm_pct = fan_pct(fan_ioctl(tuxedo_io_fd, IOCTL_FANSPEED2))
@@ -927,13 +1077,23 @@ def main():
             fan2_temp_c = fan_temp(fan_ioctl(tuxedo_io_fd, IOCTL_FAN_TEMP2))
 
             now = datetime.datetime.now()
-            if (bat["status"] == "Discharging" and bat["w_sys"] is not None
-                    and bat["w_sys"] > 0):
-                recent_w_sys.append((now, bat["w_sys"]))
-            eta_cutoff = now - datetime.timedelta(seconds=ETA_WINDOW_SEC)
-            recent_w_sys = [(t, w) for (t, w) in recent_w_sys if t >= eta_cutoff]
-            eta_empty_s = compute_eta_empty_s(recent_w_sys, bat, now)
-            eta_full_s = compute_eta_full_s(bat)
+            eta_empty_raw = compute_eta_empty_s(bat, last_applied)
+            # EWMA-smooth the emitted discharge ETA (the widget displays this).
+            # Reset between discharge sessions (raw is None off-battery) and
+            # across sample gaps > 3 ticks, so we never smooth over a suspend.
+            # Charge ETA needs no smoothing -- the SoC curve is already smooth.
+            if eta_empty_raw is None:
+                eta_empty_ewma = None
+            elif (eta_empty_ewma is None or eta_empty_prev_t is None
+                    or (now - eta_empty_prev_t).total_seconds() > POLL_SEC * 3):
+                eta_empty_ewma = eta_empty_raw
+            else:
+                eta_empty_ewma = (ETA_EMPTY_EWMA_ALPHA * eta_empty_raw
+                                  + (1 - ETA_EMPTY_EWMA_ALPHA) * eta_empty_ewma)
+            eta_empty_prev_t = now
+            eta_empty_s = eta_empty_ewma
+            eta_full_s = compute_eta_full_s(bat, cap)
+            upower = read_upower()
 
             log_tick({
                 "t": now.isoformat(timespec="seconds"),
@@ -944,7 +1104,6 @@ def main():
                 "ac": int(ac),
                 "cap": cap,
                 "cap_th": bat["cap_th"],
-                "tte_s": tte_s,
                 "current": last_applied,
                 "target": target,
                 "pending": pending_target,
@@ -979,6 +1138,9 @@ def main():
                 "fan2_temp_c": fan2_temp_c,
                 "eta_empty_s": round(eta_empty_s) if eta_empty_s is not None else None,
                 "eta_full_s": round(eta_full_s) if eta_full_s is not None else None,
+                "upower_w": round(upower["w"], 2) if upower["w"] is not None else None,
+                "upower_eta_empty_s": upower["eta_empty_s"],
+                "upower_eta_full_s": upower["eta_full_s"],
             })
 
             if mode != "auto":

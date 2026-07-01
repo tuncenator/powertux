@@ -626,3 +626,351 @@ Wired into `~/.config/waybar/config.jsonc` (`modules-right` and the
   instantaneous SoC.
 - `voltage_now`: the one signal that's worked correctly all day. The
   widget and analyze section both lean on it as the reference.
+
+## 2026-05-15 - autod / analyze tuning pass (post-3d data)
+
+3d16h of accumulated data drove four daemon changes and three analyze
+ones. Replay simulator (`whatif` section) projects chatter 68% -> 34%
+and trans/hr 8.1 -> 2.5 on the same window.
+
+autod:
+- L2/L3 hysteresis 1.5 / 2.5 (was symmetric 2.0 inside the noise band).
+- `UPGRADE_HOLD_SEC` 5 -> 20, `DOWNGRADE_HOLD_SEC` 30 -> 20.
+- L1 trigger now lid-closed-no-externals or backlight=0 (was load-only
+  "all 3 windows < 1", 0.3% residency).
+
+analyze:
+- New `whatif` section replays through arbitrary thresholds.
+- `hour-of-day` load metric mean -> median (a runaway-process spike on
+  2026-05-14 pushed load1m to 9k for ~6 min and skewed every mean).
+- Dropped `ribbon` (duplicated `timeline` at coarser resolution).
+- `EXPECTED` policy table, documented-policy print, threshold-sensitivity
+  band labels, and README decision table all updated to match.
+
+## 2026-05-21 - ETA accuracy audit: log upower silently, build comparator
+
+Complaint: widget ETA "looks like garbage". Pulled data; built a tool
+that detects charge/discharge cycles and scores each logged ETA
+predictor against the actual time-to-end of the cycle.
+
+Two diagnoses came out of the audit before the new comparator could
+even produce numbers:
+
+1. `tte_s` (`/sys/class/power_supply/BAT0/time_to_empty_now`) is
+   literally always 0 in the log. The file doesn't exist on this BAT0
+   (charge-based sysfs interface, no energy/time fields exposed);
+   `read_int(TTE_FILE, 0)` returned the default for 15,384/15,384
+   discharge ticks. Schema artifact, not a kernel reading. Dropped
+   from log_tick. Removed TTE_FILE.
+
+2. `eta_empty_s` was null on ALL 1551 ticks of 2026-05-21's main 2h09m
+   discharge segment (12:21-14:30). `compute_eta_empty_s` bails when
+   `raw_xif2_mah` is null, but the sibling widget code path falls back
+   to `charge_full_design` in the same case. So during that segment
+   autod logged nothing while the widget displayed a (fallback-pack-Wh)
+   ETA. Asymmetry between predictor in autod and predictor in widget.
+   Not yet fixed; surfaced for triage.
+
+Schema changes:
+
+- Added `read_upower()`: org.freedesktop.UPower.Device GetAll via gdbus,
+  one subprocess per tick (~4ms). Parses State, EnergyRate, TimeToEmpty,
+  TimeToFull with two regexes. Silently null on subprocess failure or
+  property absence.
+- New JSONL fields per tick: `upower_w` (EnergyRate W), 
+  `upower_eta_empty_s` (TimeToEmpty s; only when State=Discharging and
+  > 0), `upower_eta_full_s` (TimeToFull s; only when State=Charging and
+  > 0). Logged silently for accuracy comparison; NOT shown in any widget.
+  upower's "0 means not applicable" treated as null to match our
+  None-when-undefined convention.
+
+`bin/powertux-eta-compare`: focused report. Walks `log/*.jsonl{,.gz}`,
+finds segments of contiguous `Discharging` and `Charging` (same gap +
+MIN_SEGMENT_TICKS rules as eta-bench), drops open ones, and for each
+closed segment computes the actual time-to-end at every tick and
+compares the LOGGED `eta_empty_s`/`eta_full_s` (ours) and
+`upower_eta_empty_s`/`upower_eta_full_s` (upower) against it. Per-
+segment median-absolute-error table, aggregate stats with head-to-head
+win count, and horizon breakdown. Stdlib only.
+
+Differs from `powertux-eta-bench`: bench replays candidate algorithms
+fresh from raw inputs to explore the design space; compare reads the
+field that was ACTUALLY emitted at the time, so what it scores is what
+the daemon actually told the world. Independent purposes, both kept.
+
+First-run findings on 9 days of data (no upower overlap yet -- the new
+schema started writing today at 16:32):
+
+Discharge (25 closed segments, ours-only baseline):
+- per-segment med abs error ranges 5-30 min on "good" segments
+  (60min+ duration, stable load)
+- balloons to 1-3h on short segments (<20min), where the 15-min
+  rolling mean hadn't converged before the segment ended
+- segment 11 (5.2min): med err 2h14m -- 25x the segment duration
+
+Charge (46 closed segments, ours-only baseline):
+- `eta_full_s` = `(charge_full - charge_now) / current_now`
+- significantly worse than discharge: many segments show >1h median
+  error against <1h actual durations
+- root cause already known (devlog 2026-05-12 cap-vs-cells): EC re-
+  anchors charge_now non-physically and suppresses current_now during
+  trickle, so both the numerator and denominator are dirty
+
+The upower/ours head-to-head will populate after enough closed
+discharge and charge cycles land with the new schema. Re-run
+`powertux-eta-compare` to refresh.
+
+## 2026-05-21 - charge ETA: V*I rolling mean replaces kernel ABI
+
+Built `bin/powertux-eta-backtest` to simulate two candidate fixes
+against history before shipping anything:
+
+- discharge `coldsupp-d`: suppress ETA for first 180s of segment.
+  Result: med abs 33m10s -> 32m39s aggregate (1.5%), 100% ties on
+  ticks where both predict. Not worth shipping.
+- charge `rolling-c`: avg(v_bat * i_bat) over 15-min window of
+  Charging ticks, divided by `full_wh * (100 - kernel_cap) / 100`.
+  Result: med abs 36m52s -> 26m54s (27% better), p90 1h45m -> 1h14m,
+  max 82h58m -> 2h53m (kills the outlier), mean signed +47m -> +24m,
+  wins 75.9% head-to-head. Ship it.
+
+Wired `rolling-c` into autod's `compute_eta_full_s` and the widget's
+`charge_eta_seconds`. The two paths now mirror each other (autod
+maintains a tick-by-tick `recent_w_chg` list; widget reads the log
+tail). Kernel `cap` is used as SoC source during charge, not OCV
+(cells run above OCV under charge current, OCV-derived SoC would
+over-report by 5-10pp).
+
+`compute_eta_full_s` signature changed: now takes
+`(recent_w_chg, bat, cap, now)` instead of `(bat)`. Callers in
+autod's main loop updated.
+
+Re-run `powertux-eta-backtest` after the next few charge cycles to
+confirm the deployed code reproduces the simulated numbers.
+
+## 2026-05-21 - discharge ETA: tier-conditional baseline replaces rolling mean
+
+Followup: extended `powertux-eta-backtest` with two more candidates,
+backtested all four on the same 26 closed discharge segments.
+
+| algo | med abs | p90 | max | vs baseline |
+|---|---:|---:|---:|---:|
+| baseline-d (rolling w_sys 15-min) | 33m10s | 3h28m | 6h52m | (current) |
+| coldsupp-d (suppress first 180s) | 32m39s | 3h30m | 5h35m | +1.5% |
+| **tier-d** (`rem_wh / TIER_W[tier]`) | **22m08s** | **1h36m** | **2h32m** | **+33%** |
+| reg-d (numpy OLS, LOO-CV) | 24m57s | 1h50m | 3h36m | +25% |
+
+Head-to-head: tier-d wins 66.9% of same-tick ticks against baseline-d;
+reg-d 66.7%. tier-d also beats reg-d on every aggregate metric AND has
+no training step / no numpy dep.
+
+Rationale: within a tier the per-tick load swings (Claude agent runs,
+build bursts, video playback) average out over the multi-hour discharge
+timescale, so the 15-min rolling mean catches noise rather than signal.
+The tier identity itself is the more stable predictor; updates only on
+auto-shift or pin, which are the events that actually change the
+forward-projection.
+
+Wired tier-d into autod's `compute_eta_empty_s` (signature changed:
+takes `(bat, current_tier)` instead of `(recent_w_sys, bat, now)`) and
+into widget's `discharge_eta_seconds` (reads `current` from latest log
+tick). `recent_w_sys` removed from autod main loop (unused after the
+swap; still logged per tick as `w_sys` for future bench experiments).
+Added a `charge_full` fallback for `raw_xif2_mah` so the 2026-05-21
+"null full segment" failure mode can't recur silently.
+
+TIER_W constants `{1:19, 2:25, 3:41, 4:64}` in both autod and widget;
+documented as "update both at once after a recalibration run". From
+`results/2026-05-12-000931-odm-calibration.json` and
+`results/2026-05-11-232510-calibration.json`.
+
+Open: rerun `powertux-eta-backtest` after another N closed segments to
+verify the deployed code matches simulated numbers, and check whether
+upower's predictor (now also being logged) beats or loses to tier-d.
+If upower wins clearly, switch the widget to upower as the source and
+retire `compute_eta_empty_s`; if tier-d wins, keep it as a clean local
+predictor that's independent of the upower daemon.
+
+## 2026-07-01 - 6-week data pass: chatter re-tune, ETA verdicts, savings now measured
+
+50d01h wall-clock since the last tuning pass; 12d21h of actual autod ticks
+(223k samples, 25.8% coverage -- the rest is laptop off/suspended, 82% on
+AC). Enough closed cycles and auto-mode time to settle every "re-run after
+N cycles" item left open on 2026-05-21.
+
+### ETA: both open items closed, local predictors kept
+
+Ran `powertux-eta-compare` (logged field vs actual) and re-ran
+`powertux-eta-backtest` (candidate replay) over the full window.
+
+- Deployed algos reproduce the simulated numbers. Discharge `tier-d`:
+  26m31s median abs err over 58 closed segments vs baseline-d 43m45s
+  (+39%, matches the +33% seen on the original 26-segment sample), wins
+  71.2% head-to-head. Charge `rolling-c`: 25m55s vs baseline-c 34m33s
+  (+25%), wins 72.0%. Both hold.
+- ours vs upower (the "switch the widget to upower if it wins" question):
+  ours wins both. Discharge is a blowout -- ours 30m52s vs upower 2h59m,
+  96.4% head-to-head; upower's discharge predictor is unusable on this
+  board (med rel 453%). Charge is a moderate win -- ours 24m51s vs 30m47s,
+  68.5%; upower only edges ahead in the 30-60min horizon. Decision: keep
+  tier-d and rolling-c as the local predictors, do NOT switch the widget to
+  upower. Both open items closed.
+
+### Chatter regressed to 47.9%; widened the L2/L3 band
+
+The one real problem. Observed chatter climbed back to 47.9% (350/731
+transitions reversed within 5min, 2.5/hr) vs the <25% target. Essentially
+all of it is L2<->L3 (181 L3<->L3 + 159 L2<->L2 of 350). Root cause is
+geometric: load1m spends 30.6% of the window inside [1.5, 2.5] -- exactly
+the old hysteresis band -- so the deadband filtered nothing.
+
+Backtested the fix options on the real auto dataset (reused `_simulate`
+from powertux-analyze):
+
+| variant                        | trans/hr | chatter (sim) |
+|---|---:|---:|
+| prev (1.5/2.5, hold 20/20)     | 1.47     | 33.5%         |
+| up-hold 20 -> 40               | 1.20     | 28.5%         |
+| widen band 1.2/3.0             | 0.88     | 23.2%         |
+| **widen 1.2/3.0 + up-hold 30** | **0.80** | **23.2%**     |
+| load5m decision + widen        | 0.54     | 26.6%         |
+
+Widening the deadband beats raising the hold, residency essentially
+unchanged (L2 66 / L3 32). Caveat: the simulator reports 33.5% where the
+daemon logs 47.9% (it omits the AC-edge reasserts and the load5m<8
+downgrade guard), so it under-reads absolute chatter -- treat as
+directional. Real post-fix chatter is likely ~33-37%, still the largest
+single-lever drop available.
+
+Shipped: `L2_TO_L3 2.5 -> 3.0`, `L3_TO_L2 1.5 -> 1.2`, `UPGRADE_HOLD_SEC
+20 -> 30` in autod (`DOWNGRADE_HOLD_SEC` stays 20). Daemon restarted via
+the symlink deploy (`systemctl --user restart`; no reinstall, no tccd
+restart). Updated to stay honest: analyze whatif `current` variant (plus a
+`prev` variant for the 1.5/2.5 policy), the threshold-sensitivity band, the
+near-boundary literals, the recommendations engine (now points at load5m
+as the next lever since band + hold are already widened), and the README
+decision table. load5m for the L2/L3 decision is the reserved next move if
+another 1-2 weeks still show chatter above target.
+
+### Savings now measured, not estimated
+
+`vs baseline` is 72.5% below the vendor counterfactual (obs 3113 Wh vs
+11335 Wh), and it's now 97% measured w_pkg -- back in May this path was 0%
+measured and read 16%. The observed side is honest RAPL; the baseline is
+still an interpolated vendor-default counterfactual, so the magnitude leans
+on that model, but the direction is solid. Per-tier measured package draw
+(L1 4.5W / L2 7.3W / L3 14.1W / L4 15.5W mean) sits far below the
+calibration ceilings {19,25,41,64} because those were 7z-load-saturated;
+real usage (load1m p50 1.69) rarely saturates a tier.
+
+### Battery: EC truth vs kernel ABI, cap-vs-cells reconfirmed
+
+- EC-believed full 4400 mAh vs the kernel's 5200; 15.4% apparent wear; real
+  cycle_count 11 -> 39 (+28 in window) while the kernel ABI still reports 0.
+  The raw_xif1/2/raw_cycles telemetry added 2026-05-12 is doing its job.
+  raw_xif2 (learned-full) wandered 4900 -> 3800 -> back to 4400 over the
+  window (gauge re-learning).
+- cap-vs-cells drift reconfirmed: +20.0% OCV-SoC over cap_th. But cap_th has
+  been unused (null) since 2026-05-21 -- charging is now driven by the
+  sibling charge-cap project's `charging_profile` abstraction (stationary
+  97% / balanced 2% / high_capacity 1% of the window).
+
+### Two minor drifts noted, not fixed
+
+- L1 residency 0.6%: the machine suspends rather than idling into L1, so L1
+  barely fires even with the lid-closed / backlight-0 trigger. Expected.
+- `powertux-set` never writes `cpufreq/boost`, so L1's calibrated boost=0 is
+  not applied; the drift detector flags boost=1 on 100% of L1 ticks (1389
+  ticks). Benign -- platform_profile=low-power clamps frequency anyway (L1
+  draws ~2-5W, MHz ~1150), so L1 is still a low-power state, just not via the
+  boost knob. Fix later: either write boost=0 in the L1 branch of
+  powertux-set, or relax the L1 drift expectation. Low priority at 0.6%.
+
+### Note
+
+Analyze has grown to 26 sections since this log last covered it (per-display
+power attribution, per-tier thermal + fan PWM, EC wear gauge, environment
+context). Those landed in git (fan PWM/temp telemetry, the `fans` /
+`thermal` / `displays` / `environment` sections, the drift-detector pinned
+fix) without their own devlog entries; this pass is the catch-up.
+
+## 2026-07-01 - ETA v2: 3-way study, EWMA discharge + SoC-curve charge
+
+Complaint was "discharge time isn't accurate." Built `bin/powertux-eta-3way`
+(stdlib) to compare three predictors on the real logs across several slices:
+default (waybar `{time}` = charge/current, instantaneous kernel ABI), current
+(the widget's tier-W discharge + 15-min v*i rolling-mean charge), and a v2.
+57 closed discharge segments, 138 charge segments.
+
+### The visible defect was jitter, not bias
+
+Discharge, Metric A (full ETA vs time-to-segment-end):
+
+| predictor | med err | p90 err | med jit/5s | p90 jit/5s |
+|---|---:|---:|---:|---:|
+| default   | 126m | 359m | 19.7m | 127.4m |
+| current   |  27m |  82m |  1.2m |   7.9m |
+| v2 (current+EWMA) | 27m | 81m | 0.1m | 0.7m |
+
+The number lurching ~8min between two 5s ticks (p90 jitter 7.9m) is what read
+as "inaccurate." An EWMA (alpha 0.1, ~50s tc) on the emitted ETA crushes it
+(p90 7.9m -> 0.7m) at zero accuracy cost. In the honest region (segments that
+actually drained <=20%, ticks below 40% SoC) both current and v2 are 6m -- the
+widget is accurate when it matters; the far-horizon 27m median is dominated by
+the plug-in-truncation artifact (sessions end at plug-in, not empty).
+
+Two v2 ideas were tested and REJECTED by the data:
+- Sag-correcting voltage (v + iR, R fit 0.32 ohm) + a measured per-tier system
+  divisor (L2=20W vs TIER_W 25W): made accuracy worse (61m; honest region 37m
+  vs 6m). Metric B (divisor-only) showed the per-tier median draw predicts
+  drain time worse than TIER_W, because the median is dragged down by long
+  idle-at-L2 stretches that never drain; the sessions that reach empty are the
+  high-load ones. Correct-looking physics, wrong constant for the job.
+
+### Charge is the mirror image: model it, don't smooth it
+
+Charge power is a repeatable, SoC-dependent CC-CV curve set by the EC (median
+v*i by decile: ~32W to 79%, then 17W @80s, 11W @90s), not exogenous user load.
+So the SoC-conditioned curve wins where the flat rolling mean fails -- near
+full, where the mean keeps applying CC-stage watts after the current tapered:
+
+- taper region (cap>=70%, segments reaching full): v2 curve 4m vs current 10m
+- p90 tail 121m -> 85m; 1h+ horizon 28m -> 17m
+- slightly worse overall median (24 -> 29m) on short top-ups that get unplugged
+  before full -- cases nobody watches.
+
+EWMA buys nothing on charge (rolling-c is already smooth). A charger-adaptive
+hybrid (scale the curve by recent actual v*i) was tested and REJECTED (41m,
+p90 235m -- the global scale amplifies noise). The static curve is robust
+anyway: the stationary profile (97% of charging) rate-limits at the EC, so
+charge power is charger-independent. Re-derive the curve if a faster default
+profile is adopted.
+
+The asymmetry is the whole point: discharge power is exogenous (your load) so
+you can only smooth it; charge power is endogenous (the charger's CC-CV
+program) so you can model it.
+
+### Deployed
+
+autod is now the single ETA predictor; the widget just displays its logged
+value (`eta_empty_s` / `eta_full_s`) with an unsmoothed local fallback if autod
+is stale/down. Removes the duplicated predictor the two had been maintaining in
+parallel.
+
+- autod: `compute_eta_empty_s` unchanged (raw tier-W) but the main loop now
+  EWMA-smooths it (`ETA_EMPTY_EWMA_ALPHA=0.1`, reset between sessions and across
+  >3-tick gaps so it never smooths over a suspend). `compute_eta_full_s`
+  rewritten to integrate remaining Wh over `CHG_W_CURVE` (drops the
+  `recent_w_chg` rolling window). Logged `eta_empty_s`/`eta_full_s` are now the
+  smoothed/curve values (what the widget shows).
+- widget `battery-soc`: `read_logged_eta()` reads autod's latest fresh tick;
+  local `discharge_eta_seconds`/`charge_eta_seconds` kept only as fallback.
+- waybar: discovered the stock `battery` module (the "default", crude
+  `{time}`) was defined but placed in no bar -- the custom `battery-soc` was
+  already the only battery display. Removed the dead stock block.
+- New tool `bin/powertux-eta-3way` (referenced above); reproduces the numbers.
+
+Open: verify live once on battery -- the widget rendered correctly at Full
+(`--`), and the predictors unit-tested sane, but a real discharge/charge cycle
+under the new autod hasn't been observed yet. Re-run `powertux-eta-3way` after
+a few cycles to confirm deployed output matches the backtest.

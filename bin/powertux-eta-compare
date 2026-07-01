@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""powertux-eta-compare: detect charge/discharge cycles in autod's log,
+score the two ETA sources we log on each tick against the actual
+time-to-end of that cycle.
+
+Sources scored per cycle type:
+  Discharging:  ours = `eta_empty_s` (autod's w_sys 15-min rolling mean
+                       / OCV-Wh - 10% empty floor)
+                upower = `upower_eta_empty_s` (org.freedesktop.UPower's
+                       TimeToEmpty over its own short-window EnergyRate
+                       history, no empty floor, kernel `capacity` SoC)
+  Charging:     ours = `eta_full_s` (kernel-ABI (charge_full - charge_now)
+                       / current_now during CC; degenerate during trickle)
+                upower = `upower_eta_full_s` (TimeToFull, upower's own
+                       smoothing)
+
+Cycle detection mirrors powertux-eta-bench: contiguous run of the right
+`status` with no sample gap > 2 ticks, ending on a known transition
+(closed) or on log_end (open, excluded from accuracy stats).
+
+Both fields are read straight from the JSONL; this tool is a comparator
+of what was ACTUALLY emitted by autod/upower at the time, not a replay
+of candidate algorithms. powertux-eta-bench is for algorithm exploration;
+this is for "are the two predictors we already ship telling the truth?"
+
+upower fields were added to the schema on 2026-05-21. Older log files
+will show as "no upower data"; aggregate stats compute only on the
+overlap window.
+"""
+import argparse
+import datetime
+import gzip
+import json
+import math
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+LOG_DIR_DEFAULT = Path.home() / "Programs" / "powertux" / "log"
+TICK_SEC = 5
+GAP_SEC = 2 * TICK_SEC
+MIN_SEGMENT_TICKS = 30  # ~150s; shorter than this is noise
+
+INFO_COLOR = 39
+OK_COLOR = 46
+WARN_COLOR = 208
+CRIT_COLOR = 196
+DIM_COLOR = 245
+
+USE_COLOR = sys.stdout.isatty()
+
+
+def C(text, n=None, *, bold=False):
+    if not USE_COLOR:
+        return text
+    if n is None:
+        return f"\x1b[1m{text}\x1b[0m" if bold else text
+    prefix = f"\x1b[1;38;5;{n}m" if bold else f"\x1b[38;5;{n}m"
+    return f"{prefix}{text}\x1b[0m"
+
+
+def fmt_dur(seconds):
+    if seconds is None:
+        return "?"
+    s = int(abs(seconds))
+    sign = "-" if seconds < 0 else ""
+    if s < 60:
+        return f"{sign}{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{sign}{m}m{s:02d}s" if s else f"{sign}{m}m"
+    h, m = divmod(m, 60)
+    return f"{sign}{h}h{m:02d}m" if m else f"{sign}{h}h"
+
+
+def fmt_min(s):
+    return f"{s / 60:.1f} min"
+
+
+def pct(xs, p):
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    k = max(0, min(len(xs) - 1, int(round(p / 100.0 * (len(xs) - 1)))))
+    return xs[k]
+
+
+def iter_logs(log_dir, dt_from=None, dt_to=None):
+    paths_by_stem = {}
+    for p in Path(log_dir).iterdir():
+        n = p.name
+        if n.endswith(".jsonl.gz"):
+            stem = n[:-9]
+        elif n.endswith(".jsonl"):
+            stem = n[:-6]
+        else:
+            continue
+        prev = paths_by_stem.get(stem)
+        if prev is not None and prev.name.endswith(".jsonl"):
+            continue
+        paths_by_stem[stem] = p
+    for stem in sorted(paths_by_stem):
+        try:
+            d = datetime.date.fromisoformat(stem)
+        except ValueError:
+            continue
+        if dt_from and d < dt_from.date():
+            continue
+        if dt_to and d > dt_to.date():
+            continue
+        p = paths_by_stem[stem]
+        opener = gzip.open if p.name.endswith(".gz") else open
+        with opener(p, "rt") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("meta"):
+                    continue
+                try:
+                    row["_t"] = datetime.datetime.fromisoformat(row["t"])
+                except (KeyError, ValueError):
+                    continue
+                yield row
+
+
+def find_segments(rows, status_value):
+    """Walk rows; return segments of contiguous status=status_value
+    with no inter-tick gap > GAP_SEC. Same shape as bench's find_segments,
+    parameterized so we can detect both Discharging and Charging runs."""
+    segments = []
+    cur = None
+    prev_t = None
+    for row in rows:
+        t = row["_t"]
+        status = row.get("status")
+        gap = prev_t is not None and (t - prev_t).total_seconds() > GAP_SEC
+        prev_t = t
+        if status == status_value and not gap:
+            if cur is None:
+                cur = {"ticks": [], "start_t": t, "closed": False,
+                       "end_reason": None}
+            cur["ticks"].append(row)
+            cur["end_t"] = t
+        else:
+            if cur is not None:
+                cur["closed"] = True
+                cur["end_reason"] = "gap" if gap else f"status={status}"
+                segments.append(cur)
+                cur = None
+            if status == status_value:
+                cur = {"ticks": [row], "start_t": t, "end_t": t,
+                       "closed": False, "end_reason": None}
+    if cur is not None:
+        cur["end_reason"] = "log_end"
+        segments.append(cur)
+    return segments
+
+
+def usable_segments(segments):
+    """Keep only segments that are closed (real end known) and have at
+    least MIN_SEGMENT_TICKS ticks."""
+    return [s for s in segments
+            if s["closed"]
+            and len(s["ticks"]) >= MIN_SEGMENT_TICKS]
+
+
+def score_segment(seg, our_field, up_field):
+    """For each tick in seg, compute (actual_remaining_s, ours_pred,
+    upower_pred) where each pred is None if the source didn't emit a
+    value at that tick. actual_remaining_s is segment_end_time - tick_t."""
+    end_t = seg["end_t"]
+    out = []
+    for tick in seg["ticks"]:
+        actual = (end_t - tick["_t"]).total_seconds()
+        if actual < 0:
+            continue
+        ours = tick.get(our_field)
+        up = tick.get(up_field)
+        out.append((actual, ours, up))
+    return out
+
+
+def err_stats(triples, source_index):
+    """Aggregate stats for one source over a list of (actual, ours, up)
+    triples. source_index = 1 for ours, 2 for upower."""
+    errs = []
+    abs_errs = []
+    pct_errs = []
+    for tr in triples:
+        actual = tr[0]
+        pred = tr[source_index]
+        if pred is None or actual <= 0:
+            continue
+        e = pred - actual
+        errs.append(e)
+        abs_errs.append(abs(e))
+        if actual > 60:
+            pct_errs.append(abs(e) / actual)
+    n = len(errs)
+    if n == 0:
+        return None
+    return {
+        "n": n,
+        "med_abs": pct(abs_errs, 50),
+        "p90_abs": pct(abs_errs, 90),
+        "max_abs": max(abs_errs),
+        "mean_err": sum(errs) / n,
+        "med_pct": statistics.median(pct_errs) if pct_errs else float("nan"),
+        "overshoot_pct": sum(1 for e in errs if e > 0) * 100.0 / n,
+    }
+
+
+def horizon_breakdown(triples, source_index, bands):
+    """Errors bucketed by actual remaining. `bands` is a list of upper
+    bounds in seconds (last is sys.maxsize for the 'rest' band)."""
+    buckets = defaultdict(list)
+    for tr in triples:
+        actual = tr[0]
+        pred = tr[source_index]
+        if pred is None or actual <= 0:
+            continue
+        for ub in bands:
+            if actual <= ub:
+                buckets[ub].append(abs(pred - actual))
+                break
+    return buckets
+
+
+def print_segment_table(title, segs, our_field, up_field):
+    print()
+    print(C(title, None, bold=True))
+    print("-" * 78)
+    if not segs:
+        print("  (no closed segments >= "
+              f"{MIN_SEGMENT_TICKS} ticks)")
+        return
+    print(f"  {'#':<3} {'start':<20} {'dur':>9} {'ticks':>5}  "
+          f"{'ours med':>9} {'up med':>9}  notes")
+    for i, seg in enumerate(segs):
+        dur = (seg["end_t"] - seg["start_t"]).total_seconds() / 60
+        triples = score_segment(seg, our_field, up_field)
+        ours = err_stats(triples, 1)
+        up = err_stats(triples, 2)
+        ours_med = fmt_dur(ours["med_abs"]) if ours else "n/a"
+        up_med = fmt_dur(up["med_abs"]) if up else "n/a"
+        notes = []
+        if not ours:
+            notes.append("ours unavailable")
+        if not up:
+            notes.append("upower unavailable")
+        if ours and up:
+            if ours["med_abs"] < up["med_abs"]:
+                notes.append(C("ours wins", OK_COLOR))
+            elif up["med_abs"] < ours["med_abs"]:
+                notes.append(C("upower wins", WARN_COLOR))
+        print(f"  {i:<3} {seg['start_t'].strftime('%Y-%m-%d %H:%M:%S'):<20} "
+              f"{dur:>6.1f}min {len(seg['ticks']):>5}  "
+              f"{ours_med:>9} {up_med:>9}  "
+              f"{', '.join(notes)}")
+
+
+def print_aggregate(title, segs, our_field, up_field, only_overlap=True):
+    """Aggregate accuracy table. `only_overlap` restricts to segments
+    where both sources emitted a value at least once, so the comparison
+    is apples-to-apples (relevant once upower is in the log)."""
+    print()
+    print(C(title, None, bold=True))
+    print("-" * 78)
+    all_triples = []
+    overlap_segs = 0
+    skip_no_overlap = 0
+    for seg in segs:
+        triples = score_segment(seg, our_field, up_field)
+        has_ours = any(t[1] is not None for t in triples)
+        has_up = any(t[2] is not None for t in triples)
+        if only_overlap and not (has_ours and has_up):
+            skip_no_overlap += 1
+            continue
+        if has_ours or has_up:
+            overlap_segs += 1
+            all_triples.extend(triples)
+    if not all_triples:
+        print(f"  (no overlapping data; both sources never both present "
+              f"in the same closed segment yet -- upower fields were "
+              f"added 2026-05-21)")
+        if skip_no_overlap:
+            print(f"  excluded {skip_no_overlap} closed segment(s) with "
+                  f"data on only one side")
+        return
+    print(f"  segments compared: {overlap_segs}  "
+          f"(skipped {skip_no_overlap} with data on only one side)")
+    print()
+    ours = err_stats(all_triples, 1)
+    up = err_stats(all_triples, 2)
+    cols = ("source", "n", "med abs", "p90 abs", "max abs",
+            "med rel", "mean signed", "overshoot%")
+    print(f"  {cols[0]:<8} {cols[1]:>6}  {cols[2]:>9}  {cols[3]:>9}  "
+          f"{cols[4]:>9}  {cols[5]:>7}  {cols[6]:>11}  {cols[7]:>9}")
+    for label, st in (("ours", ours), ("upower", up)):
+        if st is None:
+            print(f"  {label:<8} {'-':>6}  (no data)")
+            continue
+        print(f"  {label:<8} {st['n']:>6}  "
+              f"{fmt_dur(st['med_abs']):>9}  "
+              f"{fmt_dur(st['p90_abs']):>9}  "
+              f"{fmt_dur(st['max_abs']):>9}  "
+              f"{st['med_pct'] * 100:>6.1f}%  "
+              f"{fmt_dur(st['mean_err']):>11}  "
+              f"{st['overshoot_pct']:>8.1f}%")
+    if ours and up:
+        # head-to-head: of ticks where BOTH emitted a value, who was
+        # closer to actual? gives a robust head-to-head independent of
+        # the aggregate stats above.
+        wins_ours = wins_up = ties = 0
+        for actual, o, u in all_triples:
+            if o is None or u is None or actual <= 0:
+                continue
+            do = abs(o - actual)
+            du = abs(u - actual)
+            if do < du:
+                wins_ours += 1
+            elif du < do:
+                wins_up += 1
+            else:
+                ties += 1
+        total = wins_ours + wins_up + ties
+        if total:
+            print()
+            print(f"  head-to-head (per tick, both predicted): "
+                  f"ours {wins_ours}/{total} "
+                  f"({wins_ours * 100 / total:.1f}%), "
+                  f"upower {wins_up}/{total} "
+                  f"({wins_up * 100 / total:.1f}%), "
+                  f"ties {ties}")
+
+
+def print_horizon(title, segs, our_field, up_field):
+    """How does each source's error vary with how much time remains?"""
+    print()
+    print(C(title, None, bold=True))
+    print("-" * 78)
+    bands = [30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60, sys.maxsize]
+    labels = ["0-30min", "30-60min", "1-2h", "2-4h", ">4h"]
+    all_triples = []
+    for seg in segs:
+        triples = score_segment(seg, our_field, up_field)
+        has_ours = any(t[1] is not None for t in triples)
+        has_up = any(t[2] is not None for t in triples)
+        if not (has_ours and has_up):
+            continue
+        all_triples.extend(triples)
+    if not all_triples:
+        print("  (no overlap)")
+        return
+    ours_buckets = horizon_breakdown(all_triples, 1, bands)
+    up_buckets = horizon_breakdown(all_triples, 2, bands)
+    print(f"  {'horizon':<12}  {'n':>5}  {'ours med abs':>14}  "
+          f"{'upower med abs':>14}  winner")
+    for ub, lbl in zip(bands, labels):
+        n_o = len(ours_buckets.get(ub, []))
+        n_u = len(up_buckets.get(ub, []))
+        n = max(n_o, n_u)
+        if n == 0:
+            continue
+        ours_med = pct(ours_buckets.get(ub, []), 50) if n_o else None
+        up_med = pct(up_buckets.get(ub, []), 50) if n_u else None
+        ours_s = fmt_dur(ours_med) if ours_med is not None else "n/a"
+        up_s = fmt_dur(up_med) if up_med is not None else "n/a"
+        winner = ""
+        if ours_med is not None and up_med is not None:
+            if ours_med < up_med:
+                winner = C("ours", OK_COLOR)
+            elif up_med < ours_med:
+                winner = C("upower", WARN_COLOR)
+        print(f"  {lbl:<12}  {n:>5}  {ours_s:>14}  {up_s:>14}  {winner}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Score logged ETA sources against actual "
+                    "cycle endings.")
+    p.add_argument("--log-dir", default=str(LOG_DIR_DEFAULT))
+    p.add_argument("--from", dest="dt_from",
+                   help="ISO date; segments starting before this are dropped")
+    p.add_argument("--to", dest="dt_to",
+                   help="ISO date; segments starting after this are dropped")
+    p.add_argument("--mode", choices=("discharge", "charge", "both"),
+                   default="both")
+    p.add_argument("--no-color", action="store_true")
+    args = p.parse_args()
+
+    global USE_COLOR
+    if args.no_color:
+        USE_COLOR = False
+
+    dt_from = (datetime.datetime.fromisoformat(args.dt_from)
+               if args.dt_from else None)
+    dt_to = (datetime.datetime.fromisoformat(args.dt_to)
+             if args.dt_to else None)
+
+    rows = list(iter_logs(Path(args.log_dir), dt_from, dt_to))
+    if not rows:
+        print("no log data", file=sys.stderr)
+        sys.exit(1)
+
+    print(C("=" * 78, INFO_COLOR))
+    print(C("powertux-eta-compare", INFO_COLOR, bold=True))
+    print(C("=" * 78, INFO_COLOR))
+    print(f"  log dir : {args.log_dir}")
+    print(f"  span    : {rows[0]['_t']} -> {rows[-1]['_t']}")
+    print(f"  ticks   : {len(rows)}")
+
+    if args.mode in ("discharge", "both"):
+        segs = find_segments(rows, "Discharging")
+        usable = usable_segments(segs)
+        print()
+        print(C("DISCHARGE", INFO_COLOR, bold=True))
+        print(f"  total segments: {len(segs)}; "
+              f"closed and >= {MIN_SEGMENT_TICKS} ticks: {len(usable)}")
+        print_segment_table("Per-segment median absolute error",
+                            usable, "eta_empty_s", "upower_eta_empty_s")
+        print_aggregate("Aggregate accuracy (overlap only)",
+                        usable, "eta_empty_s", "upower_eta_empty_s")
+        print_horizon("Error vs horizon (time remaining)",
+                      usable, "eta_empty_s", "upower_eta_empty_s")
+
+    if args.mode in ("charge", "both"):
+        segs = find_segments(rows, "Charging")
+        usable = usable_segments(segs)
+        print()
+        print(C("CHARGE", INFO_COLOR, bold=True))
+        print(f"  total segments: {len(segs)}; "
+              f"closed and >= {MIN_SEGMENT_TICKS} ticks: {len(usable)}")
+        print_segment_table("Per-segment median absolute error",
+                            usable, "eta_full_s", "upower_eta_full_s")
+        print_aggregate("Aggregate accuracy (overlap only)",
+                        usable, "eta_full_s", "upower_eta_full_s")
+        print_horizon("Error vs horizon (time remaining)",
+                      usable, "eta_full_s", "upower_eta_full_s")
+
+
+if __name__ == "__main__":
+    main()

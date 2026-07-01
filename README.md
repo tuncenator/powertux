@@ -147,15 +147,23 @@ why ODM=power_save lands at ~25W.
 
 ## autod decision table
 
-|                       | load1m < 2 | 2 <= load1m < 8 | load1m >= 8 |
-|---                    |---         |---              |---          |
-| **AC**                | L2         | L3              | L4          |
-| **Battery >= 60%**    | L1         | L2              | L3          |
-| **Battery 30-60%**    | L1         | L2              | L2          |
-| **Battery < 30%**     | L1         | L1              | L2          |
+|                       | load1m < 1.2  | 1.2 <= load1m < 3.0 | 3.0 <= load1m < 8 | load1m >= 8 |
+|---                    |---            |---                  |---                |---          |
+| **AC**                | L2            | L2 or L3 (hold)     | L3                | L4          |
+| **Battery >= 60%**    | L2            | L2 or L3 (hold)     | L3                | L3          |
+| **Battery 30-60%**    | L2            | L2                  | L2                | L2          |
+| **Battery < 30%**     | L1            | L1                  | L2                | L2          |
 
-- Upgrades apply on next 5s tick.
-- Downgrades require 30s of sustained low load (load1m AND load5m).
+- L1 fires on **user-absent signals**, not load alone: lid closed with no
+  external displays, OR backlight = 0. Exception: Battery < 30% falls to L1
+  on load1m < 2 regardless of presence.
+- L2/L3 boundary uses **hysteresis** (1.2 / 3.0). Once at L3, load1m must
+  drop below 1.2 to step down; from L2, it must exceed 3.0 to step up. The
+  band in between holds whichever tier is current. Widened from 1.5/2.5 on
+  2026-07-01 after 6 weeks of data showed 47.9% chatter (the old band sat
+  inside the load1m noise mass).
+- Upgrades require 30s of sustained over-threshold load (6 ticks).
+- Downgrades require 20s of sustained low load (load1m AND load5m).
 - AC plug events cause re-evaluation on the next tick.
 - Power cost of the daemon itself: ~0.001W (negligible).
 

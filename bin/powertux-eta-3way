@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Compare three battery-ETA predictors on the real autod logs, discharge and
+charge, over several slices ("simulations").
+
+  1 default : waybar battery {time} = charge_now / current_now (discharge),
+              (charge_full - charge_now) / current_now (charge). Instantaneous
+              kernel ABI; jittery, current_now-driven.
+  2 current : the widget's previous predictors -- discharge tier-W
+              (remaining_wh / TIER_W[tier]); charge 15-min v*i rolling mean.
+  3 v2      : what autod/the widget ship now -- discharge = current + EWMA
+              output smoothing; charge = SoC-conditioned charge-power curve.
+
+Ground truth is time-to-segment-end. Discharge segments usually end at plug-in
+(not empty) and charge segments often end at unplug (not full), so the "honest
+subset" restricts to segments that actually reached empty / full and scores
+only the ticks in the region that matters (near the end). Jitter is the
+tick-to-tick change in the emitted ETA -- the part a human sees swinging.
+
+Stdlib only. Mirrors autod's constants; update together after a recalibration.
+"""
+import argparse
+import datetime
+import glob
+import gzip
+import json
+import statistics as st
+from collections import defaultdict
+from pathlib import Path
+
+TIER_W = {1: 19.0, 2: 25.0, 3: 41.0, 4: 64.0}
+TIER_W_FALLBACK = 25.0
+CHG_W_CURVE = [32.0, 31.0, 30.0, 33.0, 31.0, 32.0, 33.0, 31.0, 17.0, 11.0]
+EWMA_A = 0.1
+CELLS = 4
+V_NOM_CELL = 3.7
+V_NOM_PACK = CELLS * V_NOM_CELL
+FLOOR = 10.0
+WINDOW_S = 900
+MIN_SAMPLES = 6
+GAP_S = 15
+MIN_TICKS = 30
+LOG_DIR = Path.home() / "Programs" / "powertux" / "log"
+
+OCV = [(4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85), (4.00, 80), (3.95, 75),
+       (3.90, 70), (3.85, 60), (3.80, 50), (3.75, 40), (3.70, 30), (3.65, 25),
+       (3.60, 20), (3.55, 15), (3.50, 10), (3.45, 5), (3.40, 0)]
+
+
+def ocv_soc(vc):
+    if vc >= OCV[0][0]:
+        return 100.0
+    if vc <= OCV[-1][0]:
+        return 0.0
+    for (vh, sh), (vl, sl) in zip(OCV, OCV[1:]):
+        if vl <= vc <= vh:
+            return sl + (sh - sl) * ((vc - vl) / (vh - vl))
+    return 0.0
+
+
+def load_rows(log_dir):
+    rows = []
+    for f in glob.glob(str(log_dir / "*.jsonl*")):
+        op = gzip.open if f.endswith(".gz") else open
+        with op(f, "rt") as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("meta"):
+                    continue
+                try:
+                    r["_t"] = datetime.datetime.fromisoformat(r["t"])
+                except (KeyError, ValueError):
+                    continue
+                rows.append(r)
+    rows.sort(key=lambda r: r["_t"])
+    return rows
+
+
+def segments(rows, status):
+    segs, cur = [], []
+    for r in rows:
+        if r.get("status") == status:
+            if cur and (r["_t"] - cur[-1]["_t"]).total_seconds() > GAP_S:
+                segs.append(cur)
+                cur = []
+            cur.append(r)
+        elif cur:
+            segs.append(cur)
+            cur = []
+    if cur:
+        segs.append(cur)
+    closed = [s for s in segs if len(s) >= MIN_TICKS]
+    if closed and rows and closed[-1][-1] is rows[-1]:
+        closed = closed[:-1]  # drop the open (still-running) segment
+    return closed
+
+
+def cap_wh(r):
+    mah = r.get("raw_xif2_mah") or 4400
+    return mah * CELLS * V_NOM_CELL / 1000.0
+
+
+def vi(r):
+    v, i = r.get("v_bat"), r.get("i_bat")
+    return v * i if (v and i and i > 0) else None
+
+
+def pctl(xs, p):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * p))] if xs else 0.0
+
+
+# ---------- discharge predictors (eta seconds to empty) ----------
+def d_default(r):
+    cn, i = r.get("charge_now"), r.get("i_bat")
+    if not cn or not i or i <= 0:
+        return None
+    return (cn / 1e6) / i * 3600.0
+
+
+def d_current(r):
+    v = r.get("v_bat")
+    if not v:
+        return None
+    rem = cap_wh(r) * max(0.0, ocv_soc(v / CELLS) - FLOOR) / 100
+    if rem <= 0:
+        return None
+    return rem * 3600 / TIER_W.get(r.get("current"), TIER_W_FALLBACK)
+
+
+# ---------- charge predictors (eta seconds to full) ----------
+def c_default(r):
+    cf, cn, i = r.get("charge_full"), r.get("charge_now"), r.get("i_bat")
+    if None in (cf, cn, i) or i <= 0 or cf <= cn:
+        return None
+    return (cf - cn) / 1e6 / i * 3600.0
+
+
+def c_target(r):
+    ct = r.get("cap_th")
+    return ct if (ct and 0 < ct <= 100) else 100
+
+
+def c_current(seg, k):
+    r = seg[k]
+    c = r.get("cap")
+    if c is None:
+        return None
+    tgt = c_target(r)
+    if c >= tgt:
+        return 0.0
+    t = r["_t"]
+    win = []
+    j = k
+    while j >= 0 and (t - seg[j]["_t"]).total_seconds() <= WINDOW_S:
+        p = vi(seg[j])
+        if p:
+            win.append(p)
+        j -= 1
+    if len(win) < MIN_SAMPLES:
+        return None
+    avg = sum(win) / len(win)
+    rem = cap_wh(r) * max(0.0, tgt - c) / 100
+    if rem <= 0 or avg <= 0:
+        return None
+    return rem * 3600 / avg
+
+
+def c_v2(r):
+    c = r.get("cap")
+    if c is None:
+        return None
+    tgt = c_target(r)
+    if c >= tgt:
+        return 0.0
+    wh_per_pct = cap_wh(r) / 100.0
+    secs, cc = 0.0, float(c)
+    while cc < tgt:
+        step = min(1.0, tgt - cc)
+        secs += wh_per_pct * step / CHG_W_CURVE[min(9, int(cc) // 10)] * 3600.0
+        cc += step
+    return secs
+
+
+def score(closed, emit, ewma=False):
+    """emit(seg,k)->eta_seconds. Returns per-predictor stats + per-tick records."""
+    err, jit, over, n, rec = [], [], 0, 0, []
+    for idx, s in enumerate(closed):
+        tend = s[-1]["_t"]
+        prev = None
+        for k, r in enumerate(s):
+            e = emit(s, k)
+            if e is None:
+                continue
+            if ewma and prev is not None:
+                e = EWMA_A * e + (1 - EWMA_A) * prev
+            if prev is not None:
+                jit.append(abs(e - prev) / 60.0)
+            prev = e
+            actual = (tend - r["_t"]).total_seconds()
+            if actual <= 0:
+                continue
+            err.append(abs(e - actual) / 60.0)
+            n += 1
+            if e > actual:
+                over += 1
+            rec.append((idx, actual / 60.0, e / 60.0, r.get("cap")))
+    return dict(err=err, jit=jit, over=(over / n * 100 if n else 0), rec=rec)
+
+
+def report(title, closed, preds, horizons, honest_idx, honest_pred):
+    print(f"\n{'='*78}\n{title}  ({len(closed)} closed segments)\n{'='*78}")
+    res = {name: score(closed, emit, ew) for name, (emit, ew) in preds.items()}
+    print(f"{'predictor':<10}{'medErr':>8}{'p90Err':>8}{'over%':>7}"
+          f"{'medJit':>8}{'p90Jit':>8}")
+    for name, d in res.items():
+        print(f"{name:<10}{st.median(d['err']):>7.0f}m{pctl(d['err'], .9):>7.0f}m"
+              f"{d['over']:>6.0f}%{st.median(d['jit']):>7.1f}m{pctl(d['jit'], .9):>7.1f}m")
+    print("\n  median abs error by horizon (actual time remaining):")
+    print("  " + " " * 8 + "".join(f"{lbl:>9}" for lbl, _ in horizons))
+    for name, d in res.items():
+        cells = []
+        for _, (lo, hi) in horizons:
+            e = [abs(a - p) for (i, a, p, c) in d["rec"] if lo <= a < hi]
+            cells.append(f"{st.median(e):.0f}m" if e else "-")
+        print(f"  {name:<8}" + "".join(f"{c:>9}" for c in cells))
+    hi = set(honest_idx(closed))
+    lo_c, hi_c, want_low = honest_pred
+    print(f"\n  honest subset: {len(hi)} segments reached the end; "
+          f"error on ticks with cap {'<=' if want_low else '>='}"
+          f"{lo_c if want_low else hi_c}% (the region that matters):")
+    for name, d in res.items():
+        e = [abs(a - p) for (i, a, p, c) in d["rec"]
+             if i in hi and c is not None
+             and (c <= lo_c if want_low else c >= hi_c)]
+        print(f"    {name:<8} medErr={st.median(e):.0f}m  n={len(e)}"
+              if e else f"    {name:<8} no data")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="3-way battery-ETA comparison.")
+    ap.add_argument("--log-dir", type=Path, default=LOG_DIR)
+    args = ap.parse_args()
+    rows = load_rows(args.log_dir)
+    if not rows:
+        print("no log rows found")
+        return
+    dis = segments(rows, "Discharging")
+    chg = segments(rows, "Charging")
+
+    report(
+        "DISCHARGE  ETA-to-empty", dis,
+        {"default": (lambda s, k: d_default(s[k]), False),
+         "current": (lambda s, k: d_current(s[k]), False),
+         "v2":      (lambda s, k: d_current(s[k]), True)},
+        [("0-30m", (0, 30)), ("30-60m", (30, 60)),
+         ("1-2h", (60, 120)), ("2h+", (120, 1e9))],
+        lambda cl: [i for i, s in enumerate(cl)
+                    if (s[-1].get("cap") or 100) <= 20],
+        (40, None, True))
+
+    report(
+        "CHARGE  ETA-to-full", chg,
+        {"default": (lambda s, k: c_default(s[k]), False),
+         "current": (lambda s, k: c_current(s, k), False),
+         "v2":      (lambda s, k: c_v2(s[k]), False)},
+        [("0-15m", (0, 15)), ("15-30m", (15, 30)),
+         ("30-60m", (30, 60)), ("1h+", (60, 1e9))],
+        lambda cl: [i for i, s in enumerate(cl)
+                    if (s[-1].get("cap") or 0) >= 97],
+        (None, 70, False))
+    print()
+
+
+if __name__ == "__main__":
+    main()

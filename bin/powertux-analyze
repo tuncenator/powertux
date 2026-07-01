@@ -76,8 +76,8 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 
 TICK = 5
-UPGRADE_HOLD_SEC = 5
-DOWNGRADE_HOLD_SEC = 30
+UPGRADE_HOLD_SEC = 30
+DOWNGRADE_HOLD_SEC = 20
 CHATTER_WINDOW_SEC = 300
 
 # Tunable "target" thresholds for the recommendations engine. These come
@@ -301,8 +301,11 @@ def policy_cell(r):
 
 EXPECTED = {
     ("AC", 0): 2, ("AC", 1): 3, ("AC", 2): 4,
-    ("B+", 0): 1, ("B+", 1): 2, ("B+", 2): 3,
-    ("B=", 0): 1, ("B=", 1): 2, ("B=", 2): 2,
+    # L1 on B+/B= now depends on lid/brightness signals, not just load,
+    # so the cap+load granularity defaults to L2 in those cells. B- still
+    # uses load alone for its L1 fallback.
+    ("B+", 0): 2, ("B+", 1): 2, ("B+", 2): 3,
+    ("B=", 0): 2, ("B=", 1): 2, ("B=", 2): 2,
     ("B-", 0): 1, ("B-", 1): 1, ("B-", 2): 2,
 }
 
@@ -448,7 +451,7 @@ class Summary:
         # Threshold-band residency: load1m close to a decision boundary
         # is the structural reason for chatter, so we surface it.
         self.near_l2_l3 = sum(
-            1 for r in rows if 1.5 <= (r.get("load1m") or 0) <= 2.5
+            1 for r in rows if 1.2 <= (r.get("load1m") or 0) <= 3.0
         ) * TICK
 
         # Battery sessions (used by TL;DR + battery section).
@@ -651,8 +654,8 @@ def section_tldr(s):
                f"{s.pend_reverted} reverted "
                f"({fmt_pct(s.pend_reverted / tot)} suppressed transients)")
     bullet(0,
-           f"load1m sits in [1.5, 2.5] {fmt_pct(s.near_l2_l3 / s.span)} of "
-           f"the window -- right at the L2/L3 boundary")
+           f"load1m sits in [1.2, 3.0] {fmt_pct(s.near_l2_l3 / s.span)} of "
+           f"the window -- the L2/L3 hysteresis band")
 
 
 def section_recommendations(s):
@@ -662,23 +665,19 @@ def section_recommendations(s):
     # Chatter -> upgrade-hold tune. Recommend a hold value proportional to
     # the chatter rate.
     if s.transitions and s.chatter_pct > TARGET_CHATTER_PCT:
-        # Estimate suggested hold: each 5s tick of hold removes ~the
-        # fraction of chatter that occurs inside that window. Heuristic
-        # only; full sweep belongs in a separate tool.
-        suggested = min(30, max(10, int(round(s.chatter_pct / 5)) * 5))
         recs.append((
             CRIT_COLOR if s.chatter_pct > 50 else WARN_COLOR,
-            f"raise UPGRADE_HOLD_SEC from {UPGRADE_HOLD_SEC}s "
-            f"to ~{suggested}s",
+            "move the L2/L3 decision to load5m "
+            "(band 1.2/3.0 and up-hold already widened)",
             [
-                f"reason: {s.chatter_pct:.1f}% of transitions reverted "
-                f"within {CHATTER_WINDOW_SEC // 60}min; "
-                f"load1m spends {fmt_pct(s.near_l2_l3 / s.span)} of time in "
-                f"the L2/L3 boundary band [1.5, 2.5].",
-                "effect: longer hold filters more in-band oscillation. "
-                "Trade-off: slower response to genuine load bursts.",
-                "alt: add a hysteresis band (different up vs down thresholds) "
-                "or switch L2/L3 decision to load5m (smoother around boundary).",
+                f"reason: {s.chatter_pct:.1f}% of transitions still reverted "
+                f"within {CHATTER_WINDOW_SEC // 60}min at band 1.2/3.0, hold "
+                f"{UPGRADE_HOLD_SEC}/{DOWNGRADE_HOLD_SEC}s; load1m spends "
+                f"{fmt_pct(s.near_l2_l3 / s.span)} of the window in [1.2, 3.0].",
+                "effect: load5m is smoother across the boundary -- backtest cut "
+                "trans/hr to ~0.5 vs ~0.9 for band-widening alone.",
+                "trade-off: ~1-2 ticks slower to react to a genuinely sustained "
+                "ramp, since load5m lags load1m.",
             ],
         ))
 
@@ -693,17 +692,15 @@ def section_recommendations(s):
                 f"L1 isn't reaching on battery "
                 f"(residency {fmt_pct(l1_share)})",
                 [
-                    "reason: sustained-idle threshold (load1m, load5m, "
-                    "load15m all < 1) is rarely satisfied with a browser "
-                    "or terminal open. L1 currently fires for"
-                    f" {fmt_dur(s.tier_bat.get(1, 0))} of "
-                    f"{fmt_dur(tot_bat)} on battery.",
+                    "reason: L1 fires on lid-closed+no-externals or "
+                    "backlight=0. Neither tripped often enough this "
+                    f"window: L1 only ran {fmt_dur(s.tier_bat.get(1, 0))} "
+                    f"of {fmt_dur(tot_bat)} on battery.",
                     "effect: tiered savings on battery come almost entirely "
                     "from L2 vs Battery Efficient (small delta). L1's "
                     "boost-off rail (~19W load) goes unused.",
-                    "options: lower the L1 threshold to load1m<0.5 alone, "
-                    "or add an explicit screen-DPMS-off / lid-closed "
-                    "trigger for L1.",
+                    "options: broaden the trigger -- e.g. backlight <= 10%, "
+                    "DPMS off, or screensaver active.",
                 ],
             ))
 
@@ -816,54 +813,6 @@ def section_residency(s):
     render("on battery", s.tier_bat,   sum(s.tier_bat.values()))
 
 
-def section_ribbon(s):
-    """High-resolution tier strip: variable cells/day (default sized to
-    terminal). Reveals tier sequencing in a way the 24-hour-per-day
-    timeline cannot. Useful to eyeball chatter clusters at a glance."""
-    # Adapt cell count to terminal width: 14 chars of left padding +
-    # cells. Cap at 192 (~7.5 min/cell) for daily resolution; min at 48
-    # (30 min/cell) to keep the ribbon readable on an 80-col tty.
-    avail = max(48, min(192, get_terminal_width() - 14))
-    cells_per_day = avail
-    sec_per_cell = 86400 // cells_per_day
-    minutes_per_cell = sec_per_cell // 60
-    section(f"Tier ribbon (one cell ~ {minutes_per_cell} min, "
-            f"color = dominant tier)")
-    CELLS_PER_DAY = cells_per_day
-    SEC_PER_CELL = sec_per_cell
-
-    by_day = defaultdict(list)
-    for r in s.rows:
-        by_day[r["_t"].date()].append(r)
-
-    # Compact axis showing 00 06 12 18 above the ribbon.
-    axis = [" "] * CELLS_PER_DAY
-    for hour, label in ((0, "00"), (6, "06"), (12, "12"), (18, "18")):
-        col = hour * 60 * 60 // SEC_PER_CELL
-        for j, ch in enumerate(label):
-            if col + j < CELLS_PER_DAY:
-                axis[col + j] = ch
-    print(f"  {'':12s}  " + "".join(axis))
-
-    for day in sorted(by_day.keys()):
-        cells = [" "] * CELLS_PER_DAY
-        for r in by_day[day]:
-            sec_of_day = (r["_t"].hour * 3600
-                          + r["_t"].minute * 60
-                          + r["_t"].second)
-            idx = min(CELLS_PER_DAY - 1, sec_of_day // SEC_PER_CELL)
-            lv = r.get("current")
-            if lv in (1, 2, 3, 4):
-                cells[idx] = C("█" if USE_UNICODE else "#", TIER_COLOR[lv])
-        print(f"  {day}    " + "".join(cells))
-    print()
-    legend = "  " + "  ".join(
-        f"{C('█' if USE_UNICODE else '#', TIER_COLOR[lv])} {TIER_NAME[lv]}"
-        for lv in (1, 2, 3, 4)
-    )
-    print(legend)
-
-
 def section_timeline(s):
     section("Daily timeline (height = avg load1m, color = dominant tier)")
     by_day = defaultdict(list)
@@ -955,9 +904,12 @@ def section_hour_of_day(s):
             )
             used += seg
         out.append(" " * (width - used))
-        avg = sum(loads) / len(loads) if loads else 0
+        # Median, not mean: a rare runaway-process spike (e.g. 9k load
+        # for ~6 min on 2026-05-14) wrecks the mean and makes every
+        # other hour look identical. p50 stays honest.
+        load_med = percentile(sorted(loads), 50) if loads else 0
         print(f"  {h:02d}:00  " + "".join(out)
-              + f"  load {avg:4.2f}  {fmt_dur(total)}")
+              + f"  load {load_med:4.2f}  {fmt_dur(total)}")
 
 
 def section_transitions(s):
@@ -1134,11 +1086,11 @@ def section_load_histogram(s):
         print(f"  load1m percentiles: p50 {p50:.2f}   p95 {p95:.2f}   "
               f"p99 {p99:.2f}   max {loads_1m[-1]:.2f}")
         # Concentration around L2/L3 boundary (the chatter cause).
-        near = sum(1 for x in loads_1m if 1.5 <= x <= 2.5) / len(loads_1m)
+        near = sum(1 for x in loads_1m if 1.2 <= x <= 3.0) / len(loads_1m)
         if near > 0.10:
             print(f"  {C('warn:', WARN_COLOR)} "
-                  f"{fmt_pct(near)} of ticks have load1m in [1.5, 2.5] "
-                  "(the L2/L3 decision boundary band)")
+                  f"{fmt_pct(near)} of ticks have load1m in [1.2, 3.0] "
+                  "(the L2/L3 hysteresis band)")
 
 
 def section_power_timeline(s):
@@ -1448,8 +1400,8 @@ def section_policy(s):
     print()
     print("  Documented policy:")
     print("    AC          L2 / L3 / L4")
-    print("    Bat>=60     L1 / L2 / L3")
-    print("    Bat 30-60   L1 / L2 / L2")
+    print("    Bat>=60     L2 / L2 / L3   (L1 if lid closed or backlight=0)")
+    print("    Bat 30-60   L2 / L2 / L2   (L1 if lid closed or backlight=0)")
     print("    Bat <30     L1 / L1 / L2")
 
 
@@ -1464,7 +1416,9 @@ def section_threshold_sensitivity(s):
     """
     section("Threshold sensitivity (time spent near each decision boundary)")
     BOUNDARIES = [
-        ("load1m", "L2/L3 boundary", 2.0, 0.5),
+        # L2/L3 has hysteresis: up at 3.0, down at 1.2. Time spent inside
+        # the band is held-tier time, not chatter risk.
+        ("load1m", "L2/L3 hysteresis band", 2.1, 0.9),
         ("load1m", "L3/L4 boundary", 8.0, 2.0),
         ("cap",    "Bat>=60 / 30-60 boundary", 60.0, 10.0),
         ("cap",    "Bat 30-60 / <30 boundary", 30.0, 10.0),
@@ -1490,6 +1444,147 @@ def section_threshold_sensitivity(s):
     print("  >30% = chatter risk: the decision boundary lives in the "
           "noise band.")
     print("  >10% = worth a hysteresis band or longer hold.")
+
+
+def _simulate(rows, params):
+    """Replay autod's state machine over rows with the given params.
+
+    Returns (transitions, residency_seconds). transitions is a list of
+    (t, from_lv, to_lv); the daemon's mode='pinned' stretches are skipped
+    (they don't transition under policy). Only used by section_whatif.
+    """
+    transitions = []
+    residency = Counter()
+    last = None
+    pending_target = None
+    pending_since = None
+    last_t = None
+    last_ac = None
+
+    def policy(r, cur):
+        load1m = r.get("load1m") or 0
+        ac = r.get("ac") == 1
+        cap = r.get("cap") or 100
+        lid = r.get("lid")
+        bright = r.get("brightness_pct")
+        ext = r.get("displays_ext") or 0
+        absent = (lid == "closed" and ext == 0) or (
+            bright is not None and bright == 0)
+        thr_23 = params["l3_dn"] if (cur or 0) >= 3 else params["l3_up"]
+        if ac:
+            if load1m >= params["l4"]:
+                return 4
+            if load1m >= thr_23:
+                return 3
+            return 2
+        if cap >= 60:
+            if load1m >= 8:
+                return 3
+            if absent and params["l1_absent"]:
+                return 1
+            if not params["l1_absent"] and (
+                    load1m < 1 and (r.get("load5m") or 0) < 1
+                    and (r.get("load15m") or 0) < 1):
+                return 1
+            return 2
+        if cap >= 30:
+            if absent and params["l1_absent"]:
+                return 1
+            return 2
+        if load1m >= 2:
+            return 2
+        return 1
+
+    for r in rows:
+        if r.get("mode") != "auto":
+            last = None
+            pending_target = None
+            last_t = r["_t"]
+            last_ac = r.get("ac")
+            continue
+        target = policy(r, last)
+        t = r["_t"]
+        if last is not None and last_t is not None:
+            dt = (t - last_t).total_seconds()
+            if 0 < dt <= TICK * 3:
+                residency[last] += dt
+        last_t = t
+        if last is None:
+            last = target
+            pending_target = None
+        elif target > last:
+            if pending_target == target:
+                if (t - pending_since).total_seconds() >= params["up_hold"]:
+                    transitions.append((t, last, target))
+                    last = target
+                    pending_target = None
+            else:
+                pending_target = target
+                pending_since = t
+        elif target < last:
+            if pending_target == target:
+                if (t - pending_since).total_seconds() >= params["dn_hold"]:
+                    transitions.append((t, last, target))
+                    last = target
+                    pending_target = None
+            else:
+                pending_target = target
+                pending_since = t
+        else:
+            pending_target = None
+        last_ac = r.get("ac")
+    return transitions, residency
+
+
+def section_whatif(s):
+    """Counterfactual: replay the data under two policy variants and report
+    chatter rate, residency, and transitions/hr. Lets us tune from
+    evidence rather than guessing.
+
+    Variants: 'live' is the daemon's current code (what s.rows already
+    reflect); 'old' is the pre-hysteresis policy with L1=load-only and
+    hold=5/30. Useful to confirm a change actually helps before deploying.
+    """
+    section("What-if (replay current data through alternate policy)")
+    variants = [
+        ("current  (hyst 1.2/3.0, hold 30/20, L1=absent)",
+         {"l3_up": 3.0, "l3_dn": 1.2, "l4": 8.0,
+          "up_hold": 30, "dn_hold": 20, "l1_absent": True}),
+        ("prev     (hyst 1.5/2.5, hold 20/20, L1=absent)",
+         {"l3_up": 2.5, "l3_dn": 1.5, "l4": 8.0,
+          "up_hold": 20, "dn_hold": 20, "l1_absent": True}),
+        ("old      (thr 2.0,       hold  5/30, L1=load)",
+         {"l3_up": 2.0, "l3_dn": 2.0, "l4": 8.0,
+          "up_hold": 5,  "dn_hold": 30, "l1_absent": False}),
+    ]
+    auto_rows = [r for r in s.rows if r.get("mode") == "auto"]
+    if not auto_rows:
+        print("  (no auto-mode data in window)")
+        return
+    print(f"  {'variant':<48s} {'trans/hr':>9s} {'chatter':>8s} "
+          f"{'L1':>6s} {'L2':>6s} {'L3':>6s} {'L4':>6s}")
+    for label, p in variants:
+        trans, resid = _simulate(auto_rows, p)
+        total_s = sum(resid.values()) or 1
+        # Chatter = reversed-within-5min, mirroring section_chatter.
+        chatter = 0
+        for i, (t, fr, to) in enumerate(trans):
+            for tj, fj, tj2 in trans[i + 1:]:
+                if (tj - t).total_seconds() > 300:
+                    break
+                if fj == to and tj2 == fr:
+                    chatter += 1
+                    break
+        hours = total_s / 3600
+        tr_hr = len(trans) / hours if hours else 0
+        ch_pct = chatter / len(trans) * 100 if trans else 0
+        shares = [resid.get(lv, 0) / total_s * 100 for lv in (1, 2, 3, 4)]
+        print(f"  {label:<48s} {tr_hr:>9.2f} {ch_pct:>7.1f}% "
+              + " ".join(f"{x:>5.1f}%" for x in shares))
+    print()
+    print("  delta = what 'current' should buy vs 'old' on this dataset.")
+    print("  caveat: simulator approximates the daemon (no ac-edge")
+    print("  reasserts, no load5m<8 guard on downgrade). Directional, not exact.")
 
 
 def section_battery_voltage(s):
@@ -2164,8 +2259,6 @@ SECTIONS = [
         lambda s, _: section_recommendations(s)),
     ("residency",    "Tier residency overall/AC/battery",
         lambda s, _: section_residency(s)),
-    ("ribbon",       "High-res tier ribbon (7.5min cells)",
-        lambda s, _: section_ribbon(s)),
     ("timeline",     "Daily 24h timeline",
         lambda s, _: section_timeline(s)),
     ("hour",         "Hour-of-day tier pattern",
@@ -2178,6 +2271,8 @@ SECTIONS = [
         lambda s, _: section_policy(s)),
     ("sensitivity",  "Threshold sensitivity analysis",
         lambda s, _: section_threshold_sensitivity(s)),
+    ("whatif",       "What-if replay under alternate policy",
+        lambda s, _: section_whatif(s)),
     ("load",         "Load distribution + percentiles",
         lambda s, _: section_load_histogram(s)),
     ("power",        "Power timeline per session",
@@ -2213,8 +2308,8 @@ GROUPS = [
     ("HEADER",            ["metadata", "range"]),
     ("HIGHLIGHTS",        ["tldr", "recs"]),
     ("USAGE / TIER BEHAVIOR", [
-        "residency", "ribbon", "timeline", "hour", "transitions",
-        "chatter", "policy", "sensitivity",
+        "residency", "timeline", "hour", "transitions",
+        "chatter", "policy", "sensitivity", "whatif",
     ]),
     ("LOAD / POWER",      ["load", "power", "baseline", "displays"]),
     ("BATTERY",           ["battery", "pending", "voltage", "gauge"]),
