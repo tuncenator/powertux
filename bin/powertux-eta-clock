@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Backtest the discharge-ETA gauge on the real autod logs, scoring BOTH
+endpoint accuracy AND clock behavior -- does the number tick down ~1 min per
+real min at steady load, instead of coasting through the voltage plateau then
+falling off a cliff at the knee.
+
+Compares two gauges over all closed discharge segments:
+
+  old : pure loaded-OCV energy / TIER_W[tier] rate. The flat-top/steep-knee
+        OCV curve makes the ETA coast then cliff (the "where did the hour go"
+        artifact); TIER_W also lurches when a load-average tier flip changes
+        the assumed watts without changing battery power.
+  new : coulomb SoC (kernel cap) through the plateau, blended to loaded-OCV
+        below SOC_BLEND_HI% where the steep curve is accurate; over the
+        TIER_W[tier] rate. (A measured-w_sys rate was tried and rejected --
+        w_sys spikes 40-49W over a ~24W baseline, wobbling the countdown:
+        clock-tail p90 45-56 min vs tier-W's 6.8.)
+
+Ground truth is time-to-segment-end. Most discharge segments end at plug-in,
+so whole-segment error is truncation-dominated; the honest columns restrict to
+segments that actually reached <=20% and score ticks with cap<=40%. The clock
+metric is what a human feels: over ~10-min windows at steady power, how far the
+ETA's drop deviates from the real time elapsed.
+
+Metrics (per gauge):
+  medErr/p90Err : |ETA - time-to-end|, all ticks (truncation-dominated).
+  endpt         : median |ETA - time-to-end| near empty (the honest region).
+  slope         : median dETA/dt over steady-load 10-min windows; ideal -1.00
+                  (0 = coasting flat, <-1 = cliffing).
+  clkMed/clkP90 : |ETA drop - real time elapsed| over those windows; ideal 0.
+                  "Steady load" = the window's two halves have median w_sys
+                  within 20% (so w_sys SPIKES are not filtered out -- an earlier
+                  version filtered on instantaneous w_sys variance and so hid
+                  exactly the spiky stretches a w-derived rate handles worst).
+
+Stdlib only. Mirrors autod's ETA constants and gauge; update together after a
+recalibration.  Usage: powertux-eta-clock [--log-dir DIR] [--replay [DATE]]
+"""
+import argparse
+import datetime
+import glob
+import gzip
+import json
+import statistics as st
+from pathlib import Path
+
+# --- constants, mirror bin/powertux-autod ---
+CELLS = 4
+V_NOM_CELL = 3.7
+ETA_EMPTY_FLOOR_PCT = 3
+TIER_W = {1: 19.0, 2: 25.0, 3: 41.0, 4: 64.0}
+TIER_W_FALLBACK = 25.0
+ETA_SOC_BLEND_HI = 35.0
+ETA_SOC_BLEND_LO = 20.0
+POLL_SEC = 5
+GAP_S = 15
+MIN_TICKS = 30
+HORIZON = 600.0  # clock-metric window (s); averages out integer-cap steps
+LOG_DIR = Path.home() / "Programs" / "powertux" / "log"
+
+OCV_SOC = [(4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85), (4.00, 80),
+           (3.95, 75), (3.90, 70), (3.85, 60), (3.80, 50), (3.75, 40),
+           (3.70, 30), (3.65, 25), (3.60, 20), (3.55, 15), (3.50, 10),
+           (3.45, 5), (3.40, 0)]
+
+
+def ocv_soc(vc):
+    if vc >= OCV_SOC[0][0]:
+        return 100.0
+    if vc <= OCV_SOC[-1][0]:
+        return 0.0
+    for (vh, sh), (vl, sl) in zip(OCV_SOC, OCV_SOC[1:]):
+        if vl <= vc <= vh:
+            return sl + (sh - sl) * ((vc - vl) / (vh - vl))
+    return 0.0
+
+
+def blend(cap, hi, lo):
+    if cap >= hi:
+        return 0.0
+    if cap <= lo:
+        return 1.0
+    return (hi - cap) / (hi - lo)
+
+
+def full_wh(r):
+    mah = r.get("raw_xif2_mah") or (r.get("charge_full") or 5200000) / 1000.0
+    return mah * CELLS * V_NOM_CELL / 1000.0
+
+
+# --- the two gauges (eta seconds to empty), both TIER_W rate ---
+def eta_old(seg, k):
+    r = seg[k]
+    v = r.get("v_bat")
+    if not v:
+        return None
+    rem = full_wh(r) * max(0.0, ocv_soc(v / CELLS) - ETA_EMPTY_FLOOR_PCT) / 100.0
+    if rem <= 0:
+        return 0.0
+    return rem * 3600.0 / TIER_W.get(r.get("current"), TIER_W_FALLBACK)
+
+
+def eta_new(seg, k):
+    r = seg[k]
+    v = r.get("v_bat")
+    if not v:
+        return None
+    cap = r.get("cap")
+    soc_ocv = ocv_soc(v / CELLS)
+    if cap is not None:
+        b = blend(cap, ETA_SOC_BLEND_HI, ETA_SOC_BLEND_LO)
+        soc = (1.0 - b) * cap + b * soc_ocv
+    else:
+        soc = soc_ocv
+    rem = full_wh(r) * max(0.0, soc - ETA_EMPTY_FLOOR_PCT) / 100.0
+    if rem <= 0:
+        return 0.0
+    return rem * 3600.0 / TIER_W.get(r.get("current"), TIER_W_FALLBACK)
+
+
+def load_rows(log_dir):
+    rows = []
+    for f in glob.glob(str(log_dir / "*.jsonl*")):
+        op = gzip.open if f.endswith(".gz") else open
+        with op(f, "rt") as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("meta"):
+                    continue
+                try:
+                    r["_t"] = datetime.datetime.fromisoformat(r["t"])
+                except (KeyError, ValueError):
+                    continue
+                rows.append(r)
+    rows.sort(key=lambda r: r["_t"])
+    return rows
+
+
+def segments(rows):
+    segs, cur = [], []
+    for r in rows:
+        if r.get("status") == "Discharging":
+            if cur and (r["_t"] - cur[-1]["_t"]).total_seconds() > GAP_S:
+                segs.append(cur)
+                cur = []
+            cur.append(r)
+        elif cur:
+            segs.append(cur)
+            cur = []
+    if cur:
+        segs.append(cur)
+    closed = [s for s in segs if len(s) >= MIN_TICKS]
+    if closed and rows and closed[-1][-1] is rows[-1]:
+        closed = closed[:-1]
+    return closed
+
+
+def pctl(xs, p):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * p))] if xs else 0.0
+
+
+def evaluate(closed, gauge):
+    err, endpoint, slopes, clock = [], [], [], []
+    reached = {i for i, s in enumerate(closed) if (s[-1].get("cap") or 100) <= 20}
+    for idx, s in enumerate(closed):
+        tend = s[-1]["_t"]
+        ets = [gauge(s, k) for k in range(len(s))]
+        for k, r in enumerate(s):
+            e = ets[k]
+            if e is None:
+                continue
+            actual = (tend - r["_t"]).total_seconds()
+            if actual > 0:
+                err.append(abs(e - actual) / 60.0)
+                if idx in reached and (r.get("cap") or 100) <= 40:
+                    endpoint.append(abs(e - actual) / 60.0)
+            j = k
+            while (j > 0 and (r["_t"] - s[j - 1]["_t"]).total_seconds() <= HORIZON
+                   and (s[j]["_t"] - s[j - 1]["_t"]).total_seconds() <= GAP_S):
+                j -= 1
+            dt = (r["_t"] - s[j]["_t"]).total_seconds()
+            if j < k and dt >= HORIZON * 0.5 and ets[j] is not None:
+                # steady sustained load: median w_sys of the window's two halves
+                # within 20% (spikes NOT filtered out).
+                half = (j + k) // 2
+                w1 = [s[m].get("w_sys") for m in range(j, half + 1) if s[m].get("w_sys")]
+                w2 = [s[m].get("w_sys") for m in range(half, k + 1) if s[m].get("w_sys")]
+                if w1 and w2:
+                    m1, m2 = st.median(w1), st.median(w2)
+                    if abs(m2 - m1) / ((m1 + m2) / 2) < 0.20:
+                        slopes.append((e - ets[j]) / dt)
+                        clock.append(abs((e - ets[j]) + dt) / 60.0)
+    return dict(
+        med=st.median(err) if err else 0, p90=pctl(err, .9),
+        endpt=st.median(endpoint) if endpoint else float("nan"), n_end=len(endpoint),
+        slope=st.median(slopes) if slopes else 0,
+        clock=st.median(clock) if clock else 0, clock_p90=pctl(clock, .9),
+        n=len(slopes))
+
+
+def fmt_eta(s):
+    if s is None:
+        return "  -"
+    s = int(s)
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def replay(closed, date):
+    segs = [s for s in closed if s[0]["t"][:10] == date] if date else closed
+    if not segs:
+        print(f"no discharge segment for {date or 'any date'}")
+        return
+    s = segs[-1]
+    t0 = s[0]["_t"]
+    tend = s[-1]["_t"]
+    print(f"replay {s[0]['t'][:19]} -> {s[-1]['t'][11:19]}  "
+          f"({(tend - t0).total_seconds() / 60:.0f} min, ended at cap {s[-1].get('cap')}%)\n")
+    print(f"{'time':8}{'cap':>4}{'tier':>5}{'w_sys':>6}   {'OLD':>7}{'d/10m':>7}"
+          f"   {'NEW':>7}{'d/10m':>7}{'wall':>7}")
+    po = pn = None
+    for k, r in enumerate(s):
+        mm = int((r["_t"] - t0).total_seconds())
+        if mm % 600 < POLL_SEC or k == len(s) - 1:
+            eo = eta_old(s, k)
+            en = eta_new(s, k)
+            do = f"{(eo - po) / 60:+.0f}m" if po and eo else "  -"
+            dn = f"{(en - pn) / 60:+.0f}m" if pn and en else "  -"
+            wall = (tend - r["_t"]).total_seconds()
+            print(f"{r['t'][11:19]}{str(r.get('cap')):>4}{str(r.get('current')):>5}"
+                  f"{(r.get('w_sys') or 0):>6.1f}   {fmt_eta(eo):>7}{do:>7}"
+                  f"   {fmt_eta(en):>7}{dn:>7}{fmt_eta(wall):>7}")
+            po, pn = eo, en
+    print("\nd/10m: change vs ~10 min ago; ideal about -10m at steady load.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="discharge-ETA clock+endpoint backtest")
+    ap.add_argument("--log-dir", type=Path, default=LOG_DIR)
+    ap.add_argument("--replay", nargs="?", const="", metavar="DATE",
+                    help="print the last discharge segment (optionally for YYYY-MM-DD)")
+    args = ap.parse_args()
+    rows = load_rows(args.log_dir)
+    if not rows:
+        print("no log rows found")
+        return
+    closed = segments(rows)
+    if args.replay is not None:
+        replay(closed, args.replay or None)
+        return
+    print(f"\nDISCHARGE ETA  ({len(closed)} closed segments)\n")
+    print(f"{'gauge':<8}{'medErr':>8}{'p90Err':>8}{'endpt':>7}{'slope':>8}"
+          f"{'clkMed':>8}{'clkP90':>8}")
+    print("-" * 55)
+    for name, g in (("old", eta_old), ("new", eta_new)):
+        d = evaluate(closed, g)
+        print(f"{name:<8}{d['med']:>7.0f}m{d['p90']:>7.0f}m{d['endpt']:>6.0f}m"
+              f"{d['slope']:>8.2f}{d['clock']:>7.1f}m{d['clock_p90']:>7.1f}m")
+    print("\nendpt: honest region (cap<=40 on segments reaching <=20%).")
+    print("slope: median dETA/dt at steady load, ideal -1.00 (0=coasting).")
+    print("clk*:  |ETA drop - real elapsed| over 10-min steady windows, ideal 0.")
+
+
+if __name__ == "__main__":
+    main()

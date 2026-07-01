@@ -974,3 +974,134 @@ Open: verify live once on battery -- the widget rendered correctly at Full
 (`--`), and the predictors unit-tested sane, but a real discharge/charge cycle
 under the new autod hasn't been observed yet. Re-run `powertux-eta-3way` after
 a few cycles to confirm deployed output matches the backtest.
+
+## 2026-07-01 - discharge ETA: coulomb-shape gauge kills the plateau-coast/knee-cliff
+
+Complaint, watching a live discharge: "it says 2h05m at 99%, isn't that too low,"
+then 40 min later "we're at 1h remaining, where did the other hour go?" Neither
+was a drain bug. Two findings, then a gauge rewrite.
+
+### Why "99%" gives ~2h (not a bug): stationary + real load
+
+The 99% is faked -- stationary clamps the pack to the ~4.17 V/cell CV plateau
+(see the 2026-05-12 entry in tuxedo-charge-cap-re) and the gauge reports 100%
+against 5200 mAh design, while the EC's learned full (`raw_xif2_mah`) is 4400
+(84.6% of design; cycle_count 0 / 39 raw, so it's the plateau, not wear). autod's
+ETA already uses xif2, so ~48 Wh usable at a real ~22 W draw (external ARZOPA on
+DP-1 + backlights) = ~2h. upower's 3h+ is the wrong one: it trusts design cap.
+
+### Where the hour "went": the OCV curve, not the battery
+
+Traced the live segment. The old ETA read remaining energy off *loaded cell
+voltage*. Li-ion OCV is flat up top and steep past the ~3.90 V/cell knee (our
+OCV_SOC slope doubles there: 5%/0.05V above -> 10%/0.05V below). So at steady
+~21 W the ETA coasted (15:30-16:00: dropped 16 min over 30 real) then cliffed
+(16:00-16:09: dropped 36 min over 9). Load sag deepens it -- ~1.4 A pushes the
+loaded reading past the knee before the rested SoC is there. The kernel coulomb
+`cap` fell nearly linearly the whole time; it was the honest-shaped signal.
+
+`eta-3way`'s "honest region" scores only cap<=40% (below the knee, where OCV is
+fine), so the artifact backtested clean and still felt broken live. Added a
+clock metric to catch it: over 10-min steady-power windows, how far the ETA's
+drop deviates from real elapsed time.
+
+### The rewrite (bin/powertux-eta-clock, 58 discharge segments)
+
+Data audit first, and it contradicts the old "current_now is pinned at 0 /
+charge_now snaps" caution: across 35,566 discharge ticks, i_bat/w_sys are 100%
+present and charge_now has ZERO upward snaps mid-discharge. So coulomb + measured
+power are both trustworthy here. (current_now is still suppressed during charge;
+this is a discharge-only finding.)
+
+`compute_eta_empty_s` is now:
+- energy: coulomb SoC (kernel `cap`, linear in drained charge) through the
+  plateau, blended to loaded-OCV below cap 35% (ETA_SOC_BLEND_HI/LO) where the
+  steep curve is the accurate SoC. Kills the coast/cliff.
+- rate: measured w_sys, a slow EWMA (ETA_EMPTY_RATE_EWMA_ALPHA=0.03, ~3min tc)
+  *seeded from tier-W* (not the first sample, which is the unplug spike), blended
+  to TIER_W below cap 40% (ETA_RATE_BLEND_HI/LO) where high-load drain makes the
+  tier constant reliable. This stops the ETA lurching when a load-average tier
+  flip changes TIER_W without changing battery power (seen live at 16:04: tier
+  2->3 dropped the old ETA 43 min while w_sys held ~22 W). The main loop keeps
+  the EWMA state (`w_rate_ewma`), reset across sessions/gaps like the ETA EWMA;
+  the existing output EWMA (alpha 0.1) still rides on top.
+
+Old vs new (bin/powertux-eta-clock):
+
+| gauge | endpt | slope@steady | clkMed | clkP90 |
+|---|---:|---:|---:|---:|
+| old (OCV / tier-W)        | 6m  | -1.25 | 5.0m | 21.8m |
+| new (coulomb+OCV / meas-W)| 9m  | -0.94 |  1.2m |  8.7m |
+
+Endpoint ~unchanged (9 vs 6 min near empty), slope near-ideal, clock-tail 2.5x
+tighter. Rejected on the data: pure coulomb (endpt fine but slope -1.48, the
+cap%-vs-xif2 scale mismatch), sag-corrected OCV (endpt 23m, over-corrects near
+empty), pure measured-W (endpt 11-14m, warm-up jitter). The blends are what make
+each term win only in the region it's good.
+
+Note the aggregate medErr got "worse" (28 -> 67m): that's the plug-in-truncation
+artifact -- ground truth is time-to-plug-in, and the old gauge's lower error was
+it collapsing early toward the (short) plug-in time. Mid-discharge the new gauge
+is closer to physical truth (15:54: cap 83%, ~22 W, ~50 Wh left -> new 2h03m vs
+old 1h33m). endpt + clock are the honest metrics; medErr is truncation noise.
+
+### Deployed
+- autod: `compute_eta_empty_s(bat, tier, w_smoothed)` rewritten; `_eta_blend`
+  helper; `w_rate_ewma` state + seed/reset in the main loop; new ETA_* constants.
+- widget `battery-soc`: primary path unchanged (shows autod's eta_empty_s). Local
+  fallback energy switched to the coulomb+OCV blend so it doesn't cliff either;
+  tooltip/docstring updated. Deployed in ~/.config, not tracked here.
+- New tool `bin/powertux-eta-clock` (aggregate + `--replay [DATE]`); reproduces
+  every number above. Restarted powertux-autod.service (symlinked, picks up edits).
+
+Open: charging when deployed, so the live discharge output hasn't been eyeballed
+under the new gauge yet. Next unplug: watch the widget tick down ~1 min/min, and
+re-run `powertux-eta-clock --replay` to confirm deployed matches the backtest.
+
+### Floor fix: ETA=0 now means actually dead, not 10% left
+
+Same session: "when it hits 0 there's still charge left -- and I plug in at
+5-15% because I can see it's about to be out, that's normal." Correct, and the
+`ETA_EMPTY_FLOOR_PCT = 10` inherited from the tier-W era was the bug: the ETA
+hit 0 at ~10% SoC, right in the normal plug-in zone, so it read 0 while the pack
+still had a real chunk left. The inherited comment ("system auto-suspends well
+before 0%") is false on this box: UPower's action is disabled (PercentageAction=0,
+CriticalPowerAction=PowerOff but never armed) and the logs show discharge running
+down to kernel 1% / 3.368 V/cell before dying. Lowered the floor to 3% (autod,
+widget, eta-clock) so ETA=0 means genuinely out, and the 5-15% plug zone now
+shows a real ~10-30 min "about to be out" countdown. Endpoint-error sweep on the
+4 run-to-empty segments is flat across floors 0-10 (5-8 min, sample-noise), so
+this is a semantics fix, not an accuracy regression.
+
+### Live shakeout: measured-W rate reverted, and a cap-wiring bug
+
+Watched an actual discharge under the deployed gauge and it was wrong: at cap 65
+the ETA read ~1h00 and barely moved. Two separate bugs, both now fixed.
+
+1. Measured-W rate wobbles; reverted to TIER_W. The rate term (slow EWMA of
+   w_sys) sat at ~38-40 W while the real sustained draw was ~24 W, because w_sys
+   on this board spikes to 40-49 W and the EWMA rides the spikes. Root cause of
+   the miss: `eta-clock`'s clock metric filtered "steady" windows by
+   INSTANTANEOUS w_sys variance, which excluded exactly the spiky stretches a
+   w-derived rate handles worst -- so the EWMA backtested clean and failed live.
+   Fixed the metric to judge steadiness by the median of the window's two halves
+   (spikes kept in). Re-scored honestly: tier-W clock-tail p90 6.8 min vs
+   EWMA 45 and trailing-median 56. So the rate is TIER_W; the coulomb energy
+   term is the whole win. Coulomb+tierW vs old OCV+tierW under the honest metric:
+   clock-tail p90 16.7 -> 6.8 min.
+
+2. compute_eta_empty_s read `bat.get("cap")`, which read_bat() never sets (the
+   main loop reads capacity into its own `cap` via read_int(CAP_FILE)). So cap
+   was always None and the gauge silently degraded to the pure-OCV term -- the
+   exact thing this rewrite replaces. The backtest missed it because it reads
+   the logged `cap` field (populated), not the daemon's bat dict. Fixed by
+   passing the loop's `cap` into compute_eta_empty_s(bat, tier, cap).
+
+Also spent a while chased by systemd: StartLimitBurst=5/10s silently refused the
+rapid restarts, so an old-code process kept running and masked the fixes. Lesson:
+after editing, `reset-failed` before `start`, and confirm the new PID/startup
+line before trusting live output.
+
+Verified live after the fix: cap 54, tier 2 -> ETA 1h20m (matches
+full_wh*(cap-3)/100 / 25 W), counting down at ~-1x real time (clock-like), no
+coast, no cliff. Deployed in autod + widget + eta-clock.
