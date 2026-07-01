@@ -146,10 +146,14 @@ TIER_W_FALLBACK = 25.0  # current_tier is None on cold start before auto applies
 # "about to be out" countdown instead of reading 0. (Was 10%, which hit 0
 # right in the plug-in zone -- useless.)
 ETA_EMPTY_FLOOR_PCT = 3
-# EWMA smoothing on the emitted discharge ETA. alpha=0.1 over 5s ticks is a
-# ~50s time constant, irrelevant at multi-hour horizons but enough to stop
-# the load-coupled jitter of the raw OCV-derived estimate.
-ETA_EMPTY_EWMA_ALPHA = 0.1
+# EWMA smoothing on the emitted discharge ETA. alpha=0.03 over 5s ticks is a
+# ~3min time constant. With the v3 measured-power rate, the raw estimate can
+# lurch tens of minutes at long (light-load) horizons as real draw moves; this
+# damps the worst single-tick jump ~33 -> ~10min (p99 5.3 -> 3.0min) at the cost
+# of ~2min more lag reacting to a real load change (e.g. a monitor unplug takes
+# ~3-4min to finish climbing). Near empty is already steady, so unaffected.
+# Was 0.1 (~50s) in the tier-W era where the raw rate was constant.
+ETA_EMPTY_EWMA_ALPHA = 0.03
 # Discharge-ETA gauge (bin/powertux-eta-clock, 2026-07-01, 58 segments). The
 # energy term is coulomb SoC (kernel `cap`, which falls linearly with drained
 # charge) through the voltage plateau, blended to loaded-OCV SoC below
