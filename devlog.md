@@ -1105,3 +1105,162 @@ line before trusting live output.
 Verified live after the fix: cap 54, tier 2 -> ETA 1h20m (matches
 full_wh*(cap-3)/100 / 25 W), counting down at ~-1x real time (clock-like), no
 coast, no cliff. Deployed in autod + widget + eta-clock.
+
+## 2026-07-01 - discharge ETA: long-window median w_sys rejected (sub-tier tracking)
+
+Revisited the one thing the tier-W rate can't do: react to a sustained load change
+that doesn't move the tier. Unplugging the external monitor drops real draw
+~24W -> ~14W (halving runtime), but autod pins L2 in the 30-60% band so `current`
+stays 2 and TIER_W[2]=25 keeps the ETA ~1.8x pessimistic. Tested the standing
+hypothesis -- a spike-robust LONG-window median of w_sys tracks the sustained change
+without single-spike wobble -- in a new sibling backtest `bin/powertux-eta-track`
+(60 closed segments, same coulomb+OCV energy term as the deployed gauge; only the
+RATE term varies). Adversarially verified with a 3-lens workflow (code/metric
+correctness, try-to-save-the-median, red-team-the-alternative) + synthesis.
+
+The data confirms the defect exactly. Per (tier x displays_ext) median w_sys:
+L2/de0 (no external) 13.7W, L2/de1 (one) 19.9W, L2/de2 (two) 24.0W -- TIER_W[2] is a
+flat 25 for all three, so at de0 the assumed rate is ~1.8x too high (ETA ~1.8x
+short). 92% of discharge ticks are L2, so this is an L2 story.
+
+### The median wins tracking and fails stability -- rejected, keep tier-W
+
+Three objectives (endpt must not regress; clkP90 stability gate must stay near
+tier-W's 6.8m; trkErr = |implied rate - centered +/-10min median w_sys|, split by
+displays_ext):
+
+| rate       | endpt | clkP90 | clkP90+E | trkErr | trk@de0 |
+|---|---:|---:|---:|---:|---:|
+| tierW (deployed) | 14m | 6.8m | 6.7m | 10.5W | 11.7W |
+| medW-10    | 15m | 65.2m | 64.9m | 0.5W | 0.5W |
+| medW-15    | 15m | 62.7m | 62.4m | 0.6W | 0.6W |
+| medW-20    | 15m | 60.8m | 60.7m | 0.8W | 0.6W |
+| medW-30    | 15m | 57.8m | 57.8m | 1.1W | 1.1W |
+| ratioW-15  | 13m | 53.1m | 51.8m | 4.8W | 3.9W |
+| tierDE     | 15m | 8.8m  | 8.6m  | 3.2W | 2.2W |
+
+Every median/ratio variant crushes tracking but fails the clock-stability gate. Two
+honesty corrections from the verification, neither of which changes the verdict:
+- The medW clkP90 (53-65m) is TWO stacked defects. ~Half is a one-time per-segment
+  WARMUP discontinuity: the rate falls back to TIER_W (25W) until the trailing median
+  warms (~7.5min in), then steps to ~13W, leaping the ETA -- a real per-unplug UX
+  jolt but not steady wobble. Warmup-clean steady-state clkP90 is ~30.9m, still
+  ~4.6x the 6.8m gate (not the ~9x a naive 62.7/6.8 implies).
+- medW's trkErr (0.5-0.8W) is near-tautological: a trailing median of w_sys scored
+  against a centered median of the SAME w_sys. The tracking win is directional, not
+  that tight. It's rejected on stability regardless.
+
+WHY it's fundamental (verified, not a tuning gap): eta = E/rate, so eta ~ 1/rate. At
+de0 the true rate is low (~10W) so the ETA is long (~4h) and any rate movement maps
+to a large minute-swing -- sensitivity is ~21-24 min per watt. The de=0 replay
+(`powertux-eta-track`, longest flat ~8-13W stretch) shows medW-15's ETA bouncing
+2h31m -> 4h42m and back while the load is flat. That IS the wobble a human reads as
+"inaccurate" -- the exact complaint the whole ETA line of work chased. A rate that
+moves to track load moves the countdown; tier-W's stability is that it doesn't move.
+The gate is fair, not anti-non-constant (tierDE is non-constant and passes at 8.8m);
+sweeping windows to 60min, trimmed means, tier-blends and slew limits, the entire
+median frontier collapses to a ~13% dent on the de0 bias by the time it reaches the
+gate. Scoped question answered: no long-window median beats tier-W without wobbling.
+Keep tier-W. Nothing deployed.
+
+### The right family is a discrete key, but it's not ready -- proposed, not deployed
+
+tier-W's de0 defect is BIAS, not wobble, and the trigger (monitor plug/unplug) is
+discrete, not a continuous quantity you must low-pass. A displays_ext-keyed constant
+(tierDE: per-(tier, min(displays_ext,2)) median w_sys, blended to tier-W below cap
+40%) is the ONLY family that clears the clkP90 gate (8.8m), because a step rate
+doesn't chase noise -- and it's stateless per-tick like tier-W (displays_ext is
+already read in the main loop and logged; no trailing buffer). But the red-team
+downgraded it from "recommended follow-up" to EXPLORATORY prototype, three confirmed
+blockers before it could deploy:
+1. DE_W is NOT freezable like TIER_W. TIER_W maps to real hardware power tiers; DE_W
+   is an empirical snapshot. Split at the data midpoint, L2de1's median swings
+   15.0 -> 20.9W (~40%) and L3de2 23 -> 41W; several buckets are single-epoch
+   (L1de0/de2, L4). A frozen table ships stale -- the exact "constant that doesn't
+   match reality" tierDE is supposed to cure. It would need a recalibration cadence.
+2. It's LOAD-BLIND. It captures the monitor axis only, so it fixes idle-unplugged
+   (the ~24->14W case) but over-reads runtime ~2x on busy-unplugged stretches: 12.3%
+   of de0/cap>40 ticks draw >20W sustained where the 13.7W constant is ~2x low. It
+   relocates the bias rather than tracking load. Its clkP90 8.8m comes from the
+   constant sitting near true power on steady in-sample windows (de-frozen and
+   no-blend variants reproduce 8.8m byte-identically), NOT from "rare stepping"
+   (displays_ext actually flaps in bursts, e.g. 3 flips in 3 min on 06-30).
+3. Endpoint parity (15 vs 14m) is uninformative for the target case: 0 of 7
+   run-to-empty segments are de0, and near empty tierDE blends to tier-W anyway.
+
+Honest bottom line: no rate term cleanly fixes the monitor scenario. Load-reactive
+rates wobble (rejected here); discrete constants are load-blind and not freezable.
+tier-W stays the best stable choice. If the monitor case is worth pursuing, the
+direction is a displays_ext key, but it needs a DE_W recalibration policy, a
+load-aware component (or accept it only helps idle-unplug), thin-bucket fallbacks,
+and de0 run-to-empty validation data that doesn't exist in the logs yet.
+
+`bin/powertux-eta-track` reproduces every number above (`--no-detail` for the table;
+default adds the transition-straddle + de=0 replay). autod / widget / eta-clock
+unchanged.
+
+## 2026-07-01 - discharge ETA v3: measured-power rate + pessimist energy (deployed)
+
+The entry above kept tier-W to protect the smooth countdown, and rejected a measured
+rate on the clock-stability gate. Then two things reordered the priorities. A live
+discharge exposed a SECOND bug the rate study never touched, and the user was explicit:
+he wants the number roughly right and reacting to load (monitor unplug, brightness),
+and will take a bouncier countdown to get it. Smoothness was the wrong thing to
+optimize first. v3 ships the measured rate anyway and fixes the energy bug.
+
+### Two real bugs in the deployed gauge
+
+1. Energy over-reads near empty at LIGHT load. Watched live: cap 6%, tier 1, real
+   draw ~14 W, widget said 30 min. The gauge blends fully to loaded-OCV below cap
+   20%, and at 0.9 A the voltage barely sags, so 3.57 V/cell reads 17.4% SoC while
+   the coulomb counter (charge_now = 364 mAh/cell, kernel cap 6%, all agree) says
+   ~6%. 30 min at 14 W needs 6.25 Wh; charge_now had ~5.2 Wh to ZERO. Pure optimism.
+   The rewrite blended TOWARD OCV below the knee on the premise that OCV is accurate
+   there, but that only holds when the load sags the voltage; at light load OCV is
+   the liar and the coulomb counter is honest.
+2. Rate is load-blind (the tier-W problem, restated and now fixed rather than
+   tolerated): tier-W is off the power actually drawn over the next 10 min by 7.8 W
+   (9.6 W with no external monitor); v3's measured rate is off by 1.7 W.
+
+### v3: remaining_wh / measured draw
+
+- Energy: soc = cap - ramp*max(0, cap - ocv), ramp in below ETA_SOC_BLEND_HI. OCV can
+  only DISCOUNT the coulomb SoC near empty, never inflate it -- the pessimist of the
+  two. Fixes bug 1 (light load: OCV>cap so min picks cap) while keeping the high-load
+  endgame (voltage sags, OCV<cap, min picks OCV; the coulomb counter over-reports
+  deliverable charge as V collapses -- Peukert). Plateau untouched (pure coulomb).
+- Rate: trailing MEDIAN of measured w_sys over ETA_RATE_WIN_SEC=300 s (>=12 samples,
+  else TIER_W warmup fallback). Median rejects the 40-49 W spikes; a new w_rate_buf
+  in the main loop holds the trailing (t, w_sys), reset across sessions/gaps exactly
+  like the ETA EWMA. compute_eta_empty_s gained a w_rate param.
+
+### Backtest (bin/powertux-eta-track + the v3 checks)
+
+- fwdRateErr (truncation-free, 32k ticks, |implied draw - power actually drawn next
+  10 min|): deployed 7.8 W (de0 9.6, de1 4.6) -> v3 1.7 W (de0 1.6, de1 1.8). The
+  headline win: the widget is right mid-discharge and moves with the monitor.
+- endpoint: a TIE. eta-clock's endpt shows v3 "worse" (20 vs 12 m) but that's the
+  plug-in-truncation artifact (v3 predicts the real, longer time-to-empty; segments
+  end at plug-in). Scored against wall-clock + a short tail to the 3% floor (counting
+  the last ~5-11 min the user rightly refused to discard), v3 and deployed are within
+  ~2 min of each other and of truth (cap<=10: v3 2 m, deployed 4 m). v3 also converges
+  to ~0 at real death where deployed hung at ~19 min then cliffed.
+- cost: clkP90 6.9 -> 55.9 m. At long (light-load) horizons the number drifts/bounces
+  tens of minutes as real draw moves, since eta = E/rate and a small rate wiggle on a
+  4h estimate is minutes. The output EWMA(0.1) rides on top but can't smooth a slow
+  median. Accepted, deliberately, for accuracy.
+
+### Deployed
+
+autod (compute_eta_empty_s pessimist energy + w_rate param; w_rate_buf median in the
+main loop; ETA_RATE_* constants; `import statistics`), widget battery-soc (fallback
+mirrors both changes; reads a 5-min w_sys median from the log), eta-clock (new `v3`
+gauge + replay column). Restarted via the symlink deploy (reset-failed; new PID/start
+confirmed). The median-study conclusion in the entry above still holds ON ITS OWN
+TERMS (stability-first); v3 is the accuracy-first call, and bin/powertux-eta-track's
+VERDICT block is superseded by this entry.
+
+Open: deployed while charging (46%), so the live discharge output hasn't been eyeballed
+under v3 yet. Next unplug: watch the widget read the real ~2-4h at light load (not the
+old tier-W ~1.5h), tick down, drop when the monitor is plugged, and re-run
+`powertux-eta-clock --replay` to confirm deployed matches the backtest.

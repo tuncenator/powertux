@@ -4,17 +4,24 @@ endpoint accuracy AND clock behavior -- does the number tick down ~1 min per
 real min at steady load, instead of coasting through the voltage plateau then
 falling off a cliff at the knee.
 
-Compares two gauges over all closed discharge segments:
+Compares three gauges over all closed discharge segments:
 
   old : pure loaded-OCV energy / TIER_W[tier] rate. The flat-top/steep-knee
         OCV curve makes the ETA coast then cliff (the "where did the hour go"
         artifact); TIER_W also lurches when a load-average tier flip changes
         the assumed watts without changing battery power.
   new : coulomb SoC (kernel cap) through the plateau, blended to loaded-OCV
-        below SOC_BLEND_HI% where the steep curve is accurate; over the
-        TIER_W[tier] rate. (A measured-w_sys rate was tried and rejected --
-        w_sys spikes 40-49W over a ~24W baseline, wobbling the countdown:
-        clock-tail p90 45-56 min vs tier-W's 6.8.)
+        below SOC_BLEND_HI%; over the TIER_W[tier] rate. Was deployed 2026-07-01;
+        stable but load-blind (the tier constant can't see a monitor unplug that
+        doesn't flip the tier) and over-reads near empty at light load (OCV given
+        full weight below 20% reads ~17% SoC at a real ~6%).
+  v3  : DEPLOYED gauge. Energy = the pessimist of coulomb and OCV (soc = cap -
+        ramp*max(0, cap - ocv)), so OCV can only discount coulomb near empty,
+        never inflate it -- fixes the light-load over-read while keeping the
+        high-load endgame. Rate = trailing median of measured w_sys (tracks the
+        monitor/brightness the tier can't; predicts next-10min draw within ~1.7W
+        vs TIER_W's 7.8W). Cost: a bouncier countdown at long horizons (see
+        clkP90) -- accepted for accuracy; see bin/powertux-eta-track for the study.
 
 Ground truth is time-to-segment-end. Most discharge segments end at plug-in,
 so whole-segment error is truncation-dominated; the honest columns restrict to
@@ -52,6 +59,8 @@ TIER_W = {1: 19.0, 2: 25.0, 3: 41.0, 4: 64.0}
 TIER_W_FALLBACK = 25.0
 ETA_SOC_BLEND_HI = 35.0
 ETA_SOC_BLEND_LO = 20.0
+ETA_RATE_WIN_SEC = 300     # v3 rate: trailing median of w_sys over this window
+ETA_RATE_MIN_SAMPLES = 12  # fall back to TIER_W until the buffer holds this many
 POLL_SEC = 5
 GAP_S = 15
 MIN_TICKS = 30
@@ -116,6 +125,36 @@ def eta_new(seg, k):
     if rem <= 0:
         return 0.0
     return rem * 3600.0 / TIER_W.get(r.get("current"), TIER_W_FALLBACK)
+
+
+def eta_v3(seg, k):
+    """Deployed gauge (v3): pessimist-of-coulomb-and-OCV energy over a trailing
+    median of measured w_sys. Mirrors autod compute_eta_empty_s."""
+    r = seg[k]
+    v = r.get("v_bat")
+    if not v:
+        return None
+    cap = r.get("cap")
+    soc_ocv = ocv_soc(v / CELLS)
+    if cap is not None:
+        ramp = blend(cap, ETA_SOC_BLEND_HI, ETA_SOC_BLEND_LO)
+        soc = cap - ramp * max(0.0, cap - soc_ocv)
+    else:
+        soc = soc_ocv
+    rem = full_wh(r) * max(0.0, soc - ETA_EMPTY_FLOOR_PCT) / 100.0
+    if rem <= 0:
+        return 0.0
+    t_k = seg[k]["_t"]
+    ws = []
+    j = k
+    while j >= 0 and (t_k - seg[j]["_t"]).total_seconds() <= ETA_RATE_WIN_SEC:
+        w = seg[j].get("w_sys")
+        if w:
+            ws.append(w)
+        j -= 1
+    rate = (st.median(ws) if len(ws) >= ETA_RATE_MIN_SAMPLES
+            else TIER_W.get(r.get("current"), TIER_W_FALLBACK))
+    return rem * 3600.0 / rate
 
 
 def load_rows(log_dir):
@@ -219,14 +258,14 @@ def replay(closed, date):
     tend = s[-1]["_t"]
     print(f"replay {s[0]['t'][:19]} -> {s[-1]['t'][11:19]}  "
           f"({(tend - t0).total_seconds() / 60:.0f} min, ended at cap {s[-1].get('cap')}%)\n")
-    print(f"{'time':8}{'cap':>4}{'tier':>5}{'w_sys':>6}   {'OLD':>7}{'d/10m':>7}"
-          f"   {'NEW':>7}{'d/10m':>7}{'wall':>7}")
+    print(f"{'time':8}{'cap':>4}{'tier':>5}{'w_sys':>6}   {'NEW':>7}{'d/10m':>7}"
+          f"   {'V3':>7}{'d/10m':>7}{'wall':>7}")
     po = pn = None
     for k, r in enumerate(s):
         mm = int((r["_t"] - t0).total_seconds())
         if mm % 600 < POLL_SEC or k == len(s) - 1:
-            eo = eta_old(s, k)
-            en = eta_new(s, k)
+            eo = eta_new(s, k)
+            en = eta_v3(s, k)
             do = f"{(eo - po) / 60:+.0f}m" if po and eo else "  -"
             dn = f"{(en - pn) / 60:+.0f}m" if pn and en else "  -"
             wall = (tend - r["_t"]).total_seconds()
@@ -255,7 +294,7 @@ def main():
     print(f"{'gauge':<8}{'medErr':>8}{'p90Err':>8}{'endpt':>7}{'slope':>8}"
           f"{'clkMed':>8}{'clkP90':>8}")
     print("-" * 55)
-    for name, g in (("old", eta_old), ("new", eta_new)):
+    for name, g in (("old", eta_old), ("new", eta_new), ("v3", eta_v3)):
         d = evaluate(closed, g)
         print(f"{name:<8}{d['med']:>7.0f}m{d['p90']:>7.0f}m{d['endpt']:>6.0f}m"
               f"{d['slope']:>8.2f}{d['clock']:>7.1f}m{d['clock_p90']:>7.1f}m")

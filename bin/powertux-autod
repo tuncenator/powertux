@@ -97,6 +97,7 @@ import os
 import platform
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -157,8 +158,14 @@ ETA_EMPTY_EWMA_ALPHA = 0.1
 # 16.7 -> 6.8 min) at ~equal endpoint error. Rate stays TIER_W: a measured-w_sys
 # rate wobbled the countdown because w_sys spikes to 40-49W over a ~24W baseline
 # (clock-tail p90 45-56 min); see compute_eta_empty_s.
-ETA_SOC_BLEND_HI = 35.0   # coulomb SoC above this; ramp to OCV as cap falls
-ETA_SOC_BLEND_LO = 20.0   # full OCV weight at/below this
+ETA_SOC_BLEND_HI = 35.0   # coulomb SoC above this; ramp in the OCV pessimist below
+ETA_SOC_BLEND_LO = 20.0   # full OCV-pessimist weight at/below this
+# Discharge-rate term (v3, bin/powertux-eta-track): a trailing median of measured
+# w_sys, replacing the load-blind TIER_W constant. Median (not mean/EWMA) to
+# reject the 40-49W w_sys spikes; ~5 min to stay steady. Falls back to TIER_W
+# until the buffer holds ETA_RATE_MIN_SAMPLES (warmup / post-unplug transient).
+ETA_RATE_WIN_SEC = 300
+ETA_RATE_MIN_SAMPLES = 12
 # Charge-power curve: median pack charging power (v_bat*i_bat, W) by SoC
 # decile (0-9=0-9%, ..., 9=90-99%), from bin/powertux-eta-3way over 138 charge
 # segments (2026-07-01). CC ~32W to ~79%, then CV taper to 17W (80s) / 11W
@@ -916,26 +923,31 @@ def _eta_blend(cap, hi, lo):
     return (hi - cap) / (hi - lo)
 
 
-def compute_eta_empty_s(bat, current_tier, cap):
-    """Coulomb-shape / OCV-anchored discharge ETA (bin/powertux-eta-clock).
+def compute_eta_empty_s(bat, current_tier, cap, w_rate):
+    """Discharge ETA = remaining Wh / measured draw (v3, bin/powertux-eta-track).
 
     `cap` is the kernel capacity% the main loop already read (read_bat() does not
-    put it in `bat`); pass it in rather than re-reading. If None, degrades to the
-    pure-OCV term.
+    put it in `bat`); pass it in. `w_rate` is the main loop's spike-robust draw
+    estimate (5-min median of w_sys), or None to fall back to TIER_W until warm.
 
-    Energy left: coulomb SoC (kernel `cap`) through the voltage plateau, where
-    it declines linearly with drained charge, blended to loaded-OCV SoC below
-    ETA_SOC_BLEND_HI% where the steep OCV curve is the accurate SoC signal.
-    Replaces the pure-OCV term, whose flat-top/steep-knee curve made the ETA
-    coast through the plateau then fall off a cliff (the "where did the hour go"
-    artifact). Under the honest clock metric (steady sustained load, spikes not
-    filtered out): clock-tail p90 16.7 -> 6.8 min, endpoint ~unchanged.
+    Energy left: coulomb SoC (kernel `cap`, linear in drained charge) through the
+    plateau, discounted toward the loaded-OCV SoC ONLY where OCV reads *lower*
+    (soc = cap - ramp*max(0, cap - ocv), ramp in below ETA_SOC_BLEND_HI). Near
+    empty the two disagree by load: at high load the voltage sags so OCV is the
+    lower/honest one (kernel cap over-reads deliverable charge as V collapses); at
+    light load the voltage barely sags so OCV *over*-reads and coulomb is honest.
+    Taking the pessimist of the two fixes both -- the old blend trusted OCV fully
+    below 20% and so read ~17% SoC (30 min) at a real ~6% / ~14 W light-load tick.
 
-    Rate: TIER_W[current_tier]. A measured-w_sys rate was tried (EWMA and
-    trailing median) and rejected: w_sys on this board spikes to 40-49 W over a
-    ~24 W baseline, so any w-derived rate wobbles the countdown (clock-tail p90
-    45-56 min vs tier-W's 6.8). The tier constant is steady; it only steps at a
-    genuine tier change, which usually is a real sustained load change anyway.
+    Rate: measured draw `w_rate`, NOT TIER_W. The tier constant is blind to any
+    sustained load change that doesn't flip the tier -- unplugging an external
+    monitor drops draw ~24 -> ~14 W but autod pins L2 in the 30-60% band, so the
+    tier-W ETA sat ~1.8x pessimistic. Against the power actually drawn over the
+    next 10 min (bin/powertux-eta-track, 32k ticks) a 5-min median predicts within
+    ~1.7 W vs TIER_W's 7.8 W (9.6 W with no monitor). Cost: the countdown is
+    bouncier at long (light-load) horizons -- the emitted value is EWMA-smoothed
+    and w_rate is a median to contain it; endpoint accuracy is a tie (verified vs
+    wall-clock+tail truth on the segments that ran low).
 
     Falls back to charge_full (uAh) when raw_xif2_mah is unreadable, so we keep
     emitting ETAs across raw_xif2 sysfs hiccups."""
@@ -953,14 +965,15 @@ def compute_eta_empty_s(bat, current_tier, cap):
     full_wh = mah * CELLS * V_NOM_CELL / 1000.0
     soc_ocv = ocv_soc(v_bat / CELLS)
     if cap is not None:
-        b = _eta_blend(cap, ETA_SOC_BLEND_HI, ETA_SOC_BLEND_LO)
-        soc = (1.0 - b) * cap + b * soc_ocv
+        ramp = _eta_blend(cap, ETA_SOC_BLEND_HI, ETA_SOC_BLEND_LO)
+        soc = cap - ramp * max(0.0, cap - soc_ocv)
     else:
         soc = soc_ocv
     remaining_wh = full_wh * max(0.0, soc - ETA_EMPTY_FLOOR_PCT) / 100.0
     if remaining_wh <= 0:
         return 0.0
-    return remaining_wh * 3600.0 / TIER_W.get(current_tier, TIER_W_FALLBACK)
+    rate = w_rate if (w_rate is not None and w_rate > 0) else TIER_W.get(current_tier, TIER_W_FALLBACK)
+    return remaining_wh * 3600.0 / rate
 
 
 def compute_eta_full_s(bat, cap):
@@ -1033,6 +1046,7 @@ def main():
     prev_energy_t = None
     eta_empty_ewma = None   # EWMA state for the emitted discharge ETA
     eta_empty_prev_t = None  # last tick time, to reset EWMA across gaps
+    w_rate_buf = []          # trailing (t, w_sys) for the v3 discharge-rate median
 
     while True:
         try:
@@ -1112,7 +1126,22 @@ def main():
             fan2_temp_c = fan_temp(fan_ioctl(tuxedo_io_fd, IOCTL_FAN_TEMP2))
 
             now = datetime.datetime.now()
-            eta_empty_raw = compute_eta_empty_s(bat, last_applied, cap)
+            # v3 discharge-rate: trailing median of measured w_sys (spike-robust).
+            # Reset the buffer between sessions (not discharging) and across sample
+            # gaps > 3 ticks (suspend/wake), like the ETA EWMA below, so we never
+            # median across an unplug or a suspend.
+            gap = (eta_empty_prev_t is not None
+                   and (now - eta_empty_prev_t).total_seconds() > POLL_SEC * 3)
+            if bat["status"] != "Discharging" or gap:
+                w_rate_buf.clear()
+            if bat["status"] == "Discharging" and bat["w_sys"] is not None:
+                w_rate_buf.append((now, bat["w_sys"]))
+                cutoff = now - datetime.timedelta(seconds=ETA_RATE_WIN_SEC)
+                while w_rate_buf and w_rate_buf[0][0] < cutoff:
+                    w_rate_buf.pop(0)
+            w_rate = (statistics.median(w for _, w in w_rate_buf)
+                      if len(w_rate_buf) >= ETA_RATE_MIN_SAMPLES else None)
+            eta_empty_raw = compute_eta_empty_s(bat, last_applied, cap, w_rate)
             # EWMA-smooth the emitted discharge ETA (the widget displays this).
             # Reset between discharge sessions (raw is None off-battery) and
             # across sample gaps > 3 ticks, so we never smooth over a suspend.

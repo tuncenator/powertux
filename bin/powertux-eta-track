@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Sub-tier discharge-rate study: does a spike-robust long-window measured-power
+rate beat the deployed tier-W rate on tracking sustained load changes (chiefly
+plugging/unplugging an external monitor) WITHOUT regressing clock stability or
+endpoint accuracy?
+
+Sibling to bin/powertux-eta-clock. Same coulomb+OCV energy term as the deployed
+gauge (eta-clock `new`); ONLY the rate term varies:
+
+  tierW      : TIER_W[tier]                                  (deployed baseline)
+  medW-N     : trailing N-min median w_sys, tier-W fallback until the window is
+               warm, blended to tier-W below cap 40%          (N in {10,15,20,30})
+  ratioW-N   : tier-W * (trailing N-min median / per-tier nominal w_sys), same
+               warmup + near-empty blend    (keep tier-W as prior, correct by ratio)
+  tierDE     : per-(tier, displays_ext) constant w_sys, blended to tier-W near
+               empty. A discrete-key step rate, not a rolling statistic, so it does
+               not chase spikes. (DE_W table is calibrated in-sample here and is
+               EXPLORATORY: it is temporally unstable and load-blind -- see the
+               VERDICT block. Not freeze-deployable as-is.)
+
+Three objectives, printed per variant so the stability<->tracking tradeoff is
+explicit:
+
+  endpt   : median |ETA - time-to-end|, honest region (cap<=40 on segments that
+            reached <=20%). MUST NOT regress vs tierW.
+  clkP90  : |ETA drop - real elapsed| p90 over 10-min steady-load windows (steady
+            = window's two halves' median w_sys within 20%, so w_sys SPIKES are
+            kept in). MUST stay near tierW's ~6.8m -- this is the wobble gate that
+            disqualified every reactive w-rate before. clkP90+E adds the deployed
+            output-EWMA(0.1) on top (it cannot rescue a slow-median wobble).
+  trkErr  : |gauge implied rate - true sustained draw| (W), true draw = centered
+            +/-10min median w_sys. Split by displays_ext (0 = no external monitor,
+            true ~13.6W at L2; >=1 = external attached, true ~20W). Lower = better
+            sub-tier tracking. Plus a transition-straddle check around ext flips
+            and a concrete de=0 replay showing the felt wobble in minutes.
+
+SUPERSEDED (see devlog 2026-07-01 "discharge ETA v3"): this study rejected a measured
+rate under a STABILITY-first priority. The user reprioritized to accuracy and a live
+session exposed a separate near-empty energy over-read, so the deployed gauge (v3) now
+DOES use a measured-median rate + a pessimist energy term, accepting the bounce this
+study measured. The analysis below stands on its own (stability-first) terms.
+
+VERDICT (6-week data, 60 closed segments, 2026-07-01; adversarially verified):
+every median/ratio variant wins tracking massively (trkErr 10.5W -> 0.5-4.8W) but
+fails the clock-stability gate; the output-EWMA does not help; longer windows barely
+help and lag more. The reported medW clkP90 (53-65m) is TWO defects stacked: ~half
+is a one-time per-segment WARMUP discontinuity (ETA leaps when the trailing median
+first warms and the rate steps 25W->~13W, a real per-unplug UX jolt); the
+warmup-clean steady-state clkP90 is ~30m, still ~4.6x the 6.8m gate. So the median
+hypothesis is REJECTED -- keep tier-W. (Caveat: the median's trkErr is near-
+tautological -- a trailing median of w_sys scored against a centered median of the
+SAME w_sys -- so the 0.5-0.8W tracking figure is inflated; the win is directional,
+not that tight. It is rejected on stability regardless.)
+
+tierDE (a discrete displays_ext-keyed constant) is the ONLY family that clears the
+clkP90 gate (8.8m, a +30% tail cost vs 6.8m), because a step constant does not chase
+noise. But it is an EXPLORATORY prototype, NOT freeze-deployable like TIER_W, and is
+NOT deployed by this run. Its clkP90 comes from the constant sitting near true power
+on STEADY in-sample windows (de-frozen and no-blend variants reproduce 8.8m), not
+from "rare stepping" (displays_ext flaps in bursts). Three blockers before any
+deploy: (1) DE_W is temporally UNSTABLE (L2de1 median swings +5.9W / ~40% across a
+data-half split; several buckets single-epoch), so it would need a recalibration
+cadence, not a one-time freeze; (2) it is LOAD-BLIND -- it captures the monitor axis
+only, so it fixes idle-unplugged (the ~24->14W complaint) but over-reads runtime
+~2x on busy-unplugged stretches (12.3% of de0/cap>40 ticks draw >20W sustained),
+relocating the bias rather than tracking load; (3) endpoint parity is uninformative
+(0 of 7 run-to-empty segments are de0, and near empty tierDE blends to tier-W
+anyway). The honest conclusion: no rate term cleanly fixes the monitor scenario --
+load-reactive rates wobble, discrete constants are load-blind. tier-W stays.
+
+Stdlib only. Mirrors autod's ETA constants/gauge; update together after a
+recalibration.  Usage: powertux-eta-track [--log-dir DIR]
+"""
+import argparse
+import bisect
+import datetime
+import glob
+import gzip
+import json
+import statistics as st
+from collections import defaultdict
+from pathlib import Path
+
+# --- constants, mirror bin/powertux-autod / powertux-eta-clock ---
+CELLS = 4
+V_NOM_CELL = 3.7
+ETA_EMPTY_FLOOR_PCT = 3
+TIER_W = {1: 19.0, 2: 25.0, 3: 41.0, 4: 64.0}
+TIER_W_FALLBACK = 25.0
+ETA_SOC_BLEND_HI = 35.0
+ETA_SOC_BLEND_LO = 20.0
+RATE_BLEND_HI = 40.0   # rate ramps to tier-W as cap falls 40 -> 20 (high-load drain)
+RATE_BLEND_LO = 20.0
+POLL_SEC = 5
+GAP_S = 15
+MIN_TICKS = 30
+HORIZON = 600.0        # clock-metric window (s)
+GT_HALF = 600.0        # ground-truth sustained draw: centered +/-10 min median
+WARM_FRAC = 0.5        # trailing median untrusted until >= win*WARM_FRAC s covered
+WARM_MIN_N = 20        # and at least this many samples
+EWMA_ALPHA = 0.1       # deployed output-EWMA, for the clkP90+E column
+# per-tier nominal w_sys (discharge median), for ratioW; measured from this data
+TIER_NOM_W = {1: 7.4, 2: 20.1, 3: 22.0, 4: 28.0}
+LOG_DIR = Path.home() / "Programs" / "powertux" / "log"
+DE_W = {}              # (tier, min(displays_ext,2)) -> median w_sys; filled in main
+
+OCV_SOC = [(4.20, 100), (4.15, 95), (4.10, 90), (4.05, 85), (4.00, 80),
+           (3.95, 75), (3.90, 70), (3.85, 60), (3.80, 50), (3.75, 40),
+           (3.70, 30), (3.65, 25), (3.60, 20), (3.55, 15), (3.50, 10),
+           (3.45, 5), (3.40, 0)]
+
+
+def ocv_soc(vc):
+    if vc >= OCV_SOC[0][0]:
+        return 100.0
+    if vc <= OCV_SOC[-1][0]:
+        return 0.0
+    for (vh, sh), (vl, sl) in zip(OCV_SOC, OCV_SOC[1:]):
+        if vl <= vc <= vh:
+            return sl + (sh - sl) * ((vc - vl) / (vh - vl))
+    return 0.0
+
+
+def blend(cap, hi, lo):
+    if cap >= hi:
+        return 0.0
+    if cap <= lo:
+        return 1.0
+    return (hi - cap) / (hi - lo)
+
+
+def full_wh(r):
+    mah = r.get("raw_xif2_mah") or (r.get("charge_full") or 5200000) / 1000.0
+    return mah * CELLS * V_NOM_CELL / 1000.0
+
+
+def energy_wh(r):
+    """coulomb+OCV blended remaining Wh above floor (shared across all variants)."""
+    v = r.get("v_bat")
+    if not v:
+        return None
+    cap = r.get("cap")
+    soc_ocv = ocv_soc(v / CELLS)
+    if cap is not None:
+        b = blend(cap, ETA_SOC_BLEND_HI, ETA_SOC_BLEND_LO)
+        soc = (1.0 - b) * cap + b * soc_ocv
+    else:
+        soc = soc_ocv
+    return full_wh(r) * max(0.0, soc - ETA_EMPTY_FLOOR_PCT) / 100.0
+
+
+def load_rows(log_dir):
+    rows = []
+    for f in glob.glob(str(log_dir / "*.jsonl*")):
+        op = gzip.open if f.endswith(".gz") else open
+        with op(f, "rt") as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if r.get("meta"):
+                    continue
+                try:
+                    r["_t"] = datetime.datetime.fromisoformat(r["t"])
+                except (KeyError, ValueError):
+                    continue
+                rows.append(r)
+    rows.sort(key=lambda r: r["_t"])
+    return rows
+
+
+def segments(rows):
+    segs, cur = [], []
+    for r in rows:
+        if r.get("status") == "Discharging":
+            if cur and (r["_t"] - cur[-1]["_t"]).total_seconds() > GAP_S:
+                segs.append(cur)
+                cur = []
+            cur.append(r)
+        elif cur:
+            segs.append(cur)
+            cur = []
+    if cur:
+        segs.append(cur)
+    closed = [s for s in segs if len(s) >= MIN_TICKS]
+    if closed and rows and closed[-1][-1] is rows[-1]:
+        closed = closed[:-1]
+    return closed
+
+
+def pctl(xs, p):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * p))] if xs else 0.0
+
+
+def trailing_medians(seg, win_s):
+    """Causal trailing median of w_sys over [t-win_s, t]; None until warm. This is
+    what a live daemon buffer would compute from its trailing w_sys history."""
+    ts = [(r["_t"] - seg[0]["_t"]).total_seconds() for r in seg]
+    ws = [r.get("w_sys") for r in seg]
+    out = [None] * len(seg)
+    window = []          # sorted w in window
+    order = []           # (t, w) insertion order for eviction
+    for k in range(len(seg)):
+        if ws[k] is not None:
+            bisect.insort(window, ws[k])
+            order.append((ts[k], ws[k]))
+        while order and order[0][0] < ts[k] - win_s:
+            _, w_old = order.pop(0)
+            window.pop(bisect.bisect_left(window, w_old))
+        span = ts[k] - order[0][0] if order else 0.0
+        if window and span >= win_s * WARM_FRAC and len(window) >= WARM_MIN_N:
+            n = len(window)
+            out[k] = window[n // 2] if n % 2 else (window[n // 2 - 1] + window[n // 2]) / 2.0
+    return out
+
+
+def centered_medians(seg, half_s):
+    """Non-causal +/-half_s median of w_sys: the 'true sustained draw' the causal
+    candidate is trying to estimate (backtest-only, uses future samples)."""
+    ts = [(r["_t"] - seg[0]["_t"]).total_seconds() for r in seg]
+    ws = [r.get("w_sys") for r in seg]
+    out = [None] * len(seg)
+    lo = hi = 0
+    for k in range(len(seg)):
+        while lo < len(seg) and ts[lo] < ts[k] - half_s:
+            lo += 1
+        while hi < len(seg) and ts[hi] <= ts[k] + half_s:
+            hi += 1
+        vals = [ws[m] for m in range(lo, hi) if ws[m] is not None]
+        out[k] = st.median(vals) if len(vals) >= WARM_MIN_N else None
+    return out
+
+
+# --- rate variants: rate(seg, k, cache) -> W ---
+def rate_tierW(seg, k, c):
+    return TIER_W.get(seg[k].get("current"), TIER_W_FALLBACK)
+
+
+def make_medW(win_min):
+    key = ("med", win_min)
+
+    def rate(seg, k, c):
+        med = c[key][k]
+        tier = TIER_W.get(seg[k].get("current"), TIER_W_FALLBACK)
+        if med is None:
+            return tier
+        cap = seg[k].get("cap")
+        if cap is None:
+            return med
+        b = blend(cap, RATE_BLEND_HI, RATE_BLEND_LO)
+        return (1.0 - b) * med + b * tier
+    return rate, key, win_min
+
+
+def make_ratioW(win_min):
+    key = ("med", win_min)
+
+    def rate(seg, k, c):
+        med = c[key][k]
+        tier = TIER_W.get(seg[k].get("current"), TIER_W_FALLBACK)
+        if med is None:
+            return tier
+        nom = TIER_NOM_W.get(seg[k].get("current"), TIER_W_FALLBACK)
+        corrected = tier * (med / nom) if nom > 0 else tier
+        cap = seg[k].get("cap")
+        if cap is None:
+            return corrected
+        b = blend(cap, RATE_BLEND_HI, RATE_BLEND_LO)
+        return (1.0 - b) * corrected + b * tier
+    return rate, key, None
+
+
+def rate_tierDE(seg, k, c):
+    r = seg[k]
+    tier = TIER_W.get(r.get("current"), TIER_W_FALLBACK)
+    de = r.get("displays_ext")
+    if de is None:
+        return tier
+    base = DE_W.get((r.get("current"), min(de, 2)))
+    if base is None:
+        return tier
+    cap = r.get("cap")
+    if cap is None:
+        return base
+    b = blend(cap, RATE_BLEND_HI, RATE_BLEND_LO)
+    return (1.0 - b) * base + b * tier
+
+
+def eta(seg, k, rate_fn, c):
+    e = energy_wh(seg[k])
+    if e is None:
+        return None
+    if e <= 0:
+        return 0.0
+    r = rate_fn(seg, k, c)
+    if not r or r <= 0:
+        return None
+    return e * 3600.0 / r
+
+
+def ewma_smooth(ets):
+    out = [None] * len(ets)
+    prev = None
+    for k, e in enumerate(ets):
+        if e is None:
+            out[k] = None
+            prev = None
+            continue
+        prev = e if prev is None else EWMA_ALPHA * e + (1 - EWMA_ALPHA) * prev
+        out[k] = prev
+    return out
+
+
+def ext_state(r):
+    d = r.get("displays_ext")
+    return None if d is None else (1 if d >= 1 else 0)
+
+
+def evaluate(closed, rate_fn, caches, gt_cache, ewma=False):
+    err, endpoint, slopes, clock = [], [], [], []
+    trk = {0: [], 1: []}
+    trk_all = []
+    reached = {i for i, s in enumerate(closed) if (s[-1].get("cap") or 100) <= 20}
+    for idx, s in enumerate(closed):
+        c = caches[idx]
+        gt = gt_cache[idx]
+        tend = s[-1]["_t"]
+        ets = [eta(s, k, rate_fn, c) for k in range(len(s))]
+        if ewma:
+            ets = ewma_smooth(ets)
+        for k, r in enumerate(s):
+            e = ets[k]
+            if e is None:
+                continue
+            actual = (tend - r["_t"]).total_seconds()
+            if actual > 0:
+                err.append(abs(e - actual) / 60.0)
+                if idx in reached and (r.get("cap") or 100) <= 40:
+                    endpoint.append(abs(e - actual) / 60.0)
+            # tracking: implied rate vs centered sustained draw (cap>40 region)
+            g = gt[k]
+            cap = r.get("cap")
+            if g is not None and cap is not None and cap > 40:
+                re = abs(rate_fn(s, k, c) - g)
+                trk_all.append(re)
+                es = ext_state(r)
+                if es in trk:
+                    trk[es].append(re)
+            # clock/slope over steady 10-min windows
+            j = k
+            while (j > 0 and (r["_t"] - s[j - 1]["_t"]).total_seconds() <= HORIZON
+                   and (s[j]["_t"] - s[j - 1]["_t"]).total_seconds() <= GAP_S):
+                j -= 1
+            dt = (r["_t"] - s[j]["_t"]).total_seconds()
+            if j < k and dt >= HORIZON * 0.5 and ets[j] is not None:
+                half = (j + k) // 2
+                w1 = [s[m].get("w_sys") for m in range(j, half + 1) if s[m].get("w_sys")]
+                w2 = [s[m].get("w_sys") for m in range(half, k + 1) if s[m].get("w_sys")]
+                if w1 and w2:
+                    m1, m2 = st.median(w1), st.median(w2)
+                    if abs(m2 - m1) / ((m1 + m2) / 2) < 0.20:
+                        slopes.append((e - ets[j]) / dt)
+                        clock.append(abs((e - ets[j]) + dt) / 60.0)
+    return dict(
+        med=st.median(err) if err else 0, p90=pctl(err, .9),
+        endpt=st.median(endpoint) if endpoint else float("nan"), n_end=len(endpoint),
+        slope=st.median(slopes) if slopes else 0,
+        clock=st.median(clock) if clock else 0, clock_p90=pctl(clock, .9), n_clk=len(slopes),
+        trk0=st.median(trk[0]) if trk[0] else float("nan"), n0=len(trk[0]),
+        trk1=st.median(trk[1]) if trk[1] else float("nan"), n1=len(trk[1]),
+        trk=st.median(trk_all) if trk_all else float("nan"))
+
+
+def fmt(s):
+    if s is None:
+        return "  -"
+    s = int(s)
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def transition_check(closed, variants, caches):
+    flips = []
+    for idx, s in enumerate(closed):
+        prev = None
+        for k, r in enumerate(s):
+            es = ext_state(r)
+            if es is None:
+                continue
+            if prev is not None and es != prev:
+                flips.append((idx, k, prev, es))
+            prev = es
+
+    def med_w(s, k, lo, hi):
+        t0 = s[k]["_t"]
+        vals = [r["w_sys"] for r in s
+                if lo <= (r["_t"] - t0).total_seconds() <= hi and r.get("w_sys")]
+        return st.median(vals) if vals else None
+
+    def rate_at(s, idx, k, rate_fn, dt_target):
+        t0 = s[k]["_t"]
+        best, bd = None, 1e9
+        for m, r in enumerate(s):
+            d = abs((r["_t"] - t0).total_seconds() - dt_target)
+            if d < bd:
+                bd, best = d, m
+        return rate_fn(s, best, caches[idx]) if best is not None else None
+
+    names = [n for n, _, _, _ in variants]
+    print("\nTRANSITION STRADDLE (ext-state flips with data both sides)")
+    print("  cell = drate(W since -5m) / residual |rate - trueDraw| 10m after flip")
+    print("  flip                cap  wBef  wAft  " + "".join(f"{n:>10}" for n in names))
+    clean = 0
+    dir_ok = {n: 0 for n in names}
+    tot = {n: 0 for n in names}
+    for idx, k, pe, ce in flips:
+        s = closed[idx]
+        wb, wa = med_w(s, k, -600, -60), med_w(s, k, 60, 600)
+        if wb is None or wa is None:
+            continue
+        clean += 1
+        cells = []
+        for n, rf, _, _ in variants:
+            rb, ra = rate_at(s, idx, k, rf, -300), rate_at(s, idx, k, rf, 600)
+            if rb is None or ra is None:
+                cells.append("   -")
+                continue
+            tot[n] += 1
+            dtrue, drate = wa - wb, ra - rb
+            if (abs(dtrue) <= 1) or ((dtrue > 0) == (drate > 0)):
+                dir_ok[n] += 1
+            cells.append(f"{drate:+5.1f}/{abs(ra - wa):3.0f}")
+        print(f"  {s[k]['t'][5:16]} {pe}->{ce} {str(s[k].get('cap')):>3} "
+              f"{wb:5.1f} {wa:5.1f}  " + "".join(f"{c:>10}" for c in cells))
+    print(f"\n  clean flips: {clean}. direction-correct (rate moved as true draw did):")
+    print("   ", {n: f"{dir_ok[n]}/{tot[n]}" for n in names})
+
+
+def replay_de0(closed, caches):
+    """Longest sustained de=0 (no-monitor, cap>40) stretch: tierW vs medW-15 ETA
+    every ~3 min, to see the felt wobble in minutes."""
+    best, best_len = None, 0
+    for idx, s in enumerate(closed):
+        run = []
+        for k, r in enumerate(s):
+            if ext_state(r) == 0 and (r.get("cap") or 0) > 40:
+                run.append(k)
+            else:
+                if len(run) > best_len:
+                    best_len, best = len(run), (idx, run[0], run[-1])
+                run = []
+        if len(run) > best_len:
+            best_len, best = len(run), (idx, run[0], run[-1])
+    if not best:
+        print("\n(no sustained de=0 stretch found)")
+        return
+    idx, k0, k1 = best
+    s, c = closed[idx], caches[idx]
+    rf_m, _, _ = make_medW(15)
+    print(f"\nde=0 STEADY REPLAY  seg {s[k0]['t'][:10]}  "
+          f"{s[k0]['t'][11:19]}->{s[k1]['t'][11:19]}  ({best_len} ticks, flat ~8-13W)")
+    print(f"  {'time':8}{'cap':>4}{'w_sys':>7}{'tierW_eta':>11}"
+          f"{'medW15_eta':>12}{'medW_rate':>11}")
+    t0 = s[k0]["_t"]
+    for k in range(k0, k1 + 1):
+        r = s[k]
+        if (r["_t"] - t0).total_seconds() % 180 < POLL_SEC or k == k1:
+            print(f"  {r['t'][11:19]}{str(r.get('cap')):>4}{(r.get('w_sys') or 0):>7.1f}"
+                  f"{fmt(eta(s, k, rate_tierW, c)):>11}"
+                  f"{fmt(eta(s, k, rf_m, c)):>12}{rf_m(s, k, c):>10.1f}W")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="sub-tier discharge-rate tracking study")
+    ap.add_argument("--log-dir", type=Path, default=LOG_DIR)
+    ap.add_argument("--no-detail", action="store_true", help="table only")
+    args = ap.parse_args()
+    rows = load_rows(args.log_dir)
+    if not rows:
+        print("no log rows found")
+        return
+    closed = segments(rows)
+    print(f"\nDISCHARGE ETA sub-tier tracking study ({len(closed)} closed segments)\n")
+
+    # DE_W table from ALL discharge rows (per tier x clamped displays_ext).
+    buck = defaultdict(list)
+    for r in rows:
+        if r.get("status") != "Discharging":
+            continue
+        w, de, ti = r.get("w_sys"), r.get("displays_ext"), r.get("current")
+        if w and de is not None and ti is not None:
+            buck[(ti, min(de, 2))].append(w)
+    for kk, ws in buck.items():
+        if len(ws) >= WARM_MIN_N:
+            DE_W[kk] = st.median(ws)
+    print("  DE_W (per tier x displays_ext median w_sys, the de-keyed constant; "
+          "in-sample):")
+    print("   ", {f"L{t}de{d}": round(v, 1) for (t, d), v in sorted(DE_W.items())})
+    print()
+
+    variants = [("tierW", rate_tierW, None, None)]
+    for w in (10, 15, 20, 30):
+        rf, key, wm = make_medW(w)
+        variants.append((f"medW-{w}", rf, key, wm))
+    rf, key, _ = make_ratioW(15)
+    variants.append(("ratioW-15", rf, key, None))
+    variants.append(("tierDE", rate_tierDE, None, None))
+
+    wins = sorted({v[3] for v in variants if v[3]})
+    caches, gt_cache = [], []
+    for s in closed:
+        caches.append({("med", w): trailing_medians(s, w * 60.0) for w in wins})
+        gt_cache.append(centered_medians(s, GT_HALF))
+
+    print(f"{'rate':<10}{'endpt':>7}{'clkMed':>8}{'clkP90':>8}{'clkP90+E':>9}"
+          f"{'slope':>7}{'trkErr':>8}{'trk@de0':>9}{'trk@de1':>9}")
+    print("-" * 85)
+    base = None
+    for n, rf, _, _ in variants:
+        d = evaluate(closed, rf, caches, gt_cache)
+        de = evaluate(closed, rf, caches, gt_cache, ewma=True)
+        if n == "tierW":
+            base = d
+        print(f"{n:<10}{d['endpt']:>6.0f}m{d['clock']:>7.1f}m{d['clock_p90']:>7.1f}m"
+              f"{de['clock_p90']:>8.1f}m{d['slope']:>7.2f}{d['trk']:>7.1f}W"
+              f"{d['trk0']:>8.1f}W{d['trk1']:>8.1f}W")
+    print(f"\n  n: endpt={base['n_end']} clk={base['n_clk']} "
+          f"trk@de0={base['n0']} trk@de1={base['n1']}")
+    print("  endpt/clk MUST NOT regress vs tierW; trkErr lower = better tracking.")
+    print("  clkP90+E = clkP90 with the deployed output-EWMA(0.1) on top.")
+    print("  trk@de0 = no external monitor (true ~13.6W at L2); trk@de1 = external (~20W).")
+    print("  NOTE medW trkErr is near-tautological (trailing vs centered median of the SAME")
+    print("  w_sys) so its tracking figure is inflated; it is rejected on clkP90 regardless.")
+    print("  NOTE tierDE trkErr is in-sample AND load-blind (median hides a heavy tail: de0")
+    print("  p90 ~7W, p95 ~13W); its clkP90 comes from the constant sitting near true power")
+    print("  on steady in-sample windows, not from rare stepping. Exploratory, not deployable.")
+    if not args.no_detail:
+        transition_check(closed, variants, caches)
+        replay_de0(closed, caches)
+
+
+if __name__ == "__main__":
+    main()
