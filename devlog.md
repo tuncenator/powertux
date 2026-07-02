@@ -1264,3 +1264,70 @@ Open: deployed while charging (46%), so the live discharge output hasn't been ey
 under v3 yet. Next unplug: watch the widget read the real ~2-4h at light load (not the
 old tier-W ~1.5h), tick down, drop when the monitor is plugged, and re-run
 `powertux-eta-clock --replay` to confirm deployed matches the backtest.
+
+## 2026-07-02 - autod audit: L2/L3 decision moved to load5m + analyze TLDR bug
+
+Audited whether autod picks the right tier and how efficient it is over the full
+233k-sample / 51d window (26% coverage, rest off/suspended; 82% AC, 96% auto).
+
+### Verdict: level choice is faithful, efficiency is strong, one weak spot
+
+- Decision-table adherence 90-100% per policy cell. Over-provisioning (sitting at
+  L3 while load1m < 1.2) is 0.2% of L3 ticks -- the downgrade side is well-tuned,
+  we don't waste energy idling high. The scary-looking "42% of L2 ticks have
+  load1m >= 3.0 post-tune" is a red herring: ~95% of it is on battery, where the
+  policy *intentionally* caps at L2 for load 3-8 to conserve, and 83% of those
+  ticks have load5m >= 3.0 too (sustained work correctly served at L2 on battery,
+  by design). On AC, L2-while-load>=3 is ~0.4% -- it upgrades correctly.
+- Efficiency: 71.9% below the vendor counterfactual (obs 3355 Wh vs 11935 Wh),
+  97% measured w_pkg. Per-tier measured draw L1 4.6 / L2 7.4 / L3 14.8 / L4 15.5 W
+  (far below the 7z ceilings {19,25,41,64}; real load p50 1.73 rarely saturates).
+- The one real problem stayed L2<->L3 chatter (full-window 47%, post-2026-07-01
+  33% on n=21). Root cause is geometric: load1m p50 1.73 and 52.6% of ticks sit
+  inside the [1.2, 3.0] band, so any load1m threshold there flaps.
+
+### Fix: L2/L3 boundary now reads load5m (the reserved next lever)
+
+The 2026-05-15 / 2026-07-01 note kept load5m in reserve behind band-widening and
+hold-lengthening. Both are now exhausted, so pulled it. compute_target's AC L2/L3
+comparison switched load1m -> load5m (the same signal low-passed ~5 min). L4 and
+the battery load>=8 promotion stay on load1m (burst detectors; L3<->L4 is 3.9% of
+transitions, no chatter there). Holds unchanged at 30/20.
+
+Backtested via the `whatif` section (added a load5m variant + an `l23_metric`
+param to `_simulate`) on the full auto dataset:
+
+| variant                         | trans/hr | chatter% | reversals/hr |
+|---|---:|---:|---:|
+| load1m 1.2/3.0 hold 30/20 (prev) | 0.86    | 24.3%    | 0.209        |
+| **load5m 1.2/3.0 hold 30/20**    | **0.56**| 27.4%    | **0.153**    |
+
+The chatter *percentage* rises while the real thrash falls: load5m removes clean
+(non-reversing) transitions faster than reversal pairs, so the ratio's denominator
+shrinks faster than its numerator. The honest metrics -- total transitions/hr
+(-35%) and absolute reversals/hr (-27%) -- both drop, at flat residency
+(L2 67 / L3 31). An up-hold sweep confirmed 30s is still the floor: load5m up15/
+up10/up5 all regressed both trans/hr and reversals/hr (load5m drifts across the
+boundary on the ~minute scale, so the hold still earns its keep). Cost: L2->L3
+reacts ~1-2 ticks slower to a genuine ramp (load5m lag), accepted.
+
+Deployed via the symlink (`reset-failed` + `restart`; new PID confirmed, init L3
+clean, 9/9 compute_target unit cases pass). Re-run `whatif` after ~1-2 weeks to
+confirm the deployed daemon reproduces ~0.56 trans/hr.
+
+### analyze bug: TLDR under-reported band occupancy 3.8x
+
+The TL;DR and two recs lines printed "load1m sits in [1.2, 3.0] 13.9% of the
+window" -- wrong. `near_l2_l3` is in-band *time* (sec) but it was divided by
+`span` (total wall-clock, 74% of which is laptop-off gaps) instead of logged time
+`n * TICK`. Corrected to `near_l2_l3 / (n * TICK)` at all three sites; now reads
+52.6%, matching the sensitivity section and a raw recount. The stale
+"documented policy" L1 in the decision-table validation (Bat<30/load2-8; code
+returns L2) is noted but left as-is this pass.
+
+### Recs engine
+
+The "move to load5m" recommendation is spent (now deployed), so the chatter rec
+was rewritten to point at the next levers (narrow band toward 1.3/2.7, raise
+up-hold past 30s, or accept ~0.15 reversals/hr) and to warn that chatter% is a
+ratio -- read trans/hr alongside it.

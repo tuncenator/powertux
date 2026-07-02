@@ -147,23 +147,28 @@ why ODM=power_save lands at ~25W.
 
 ## autod decision table
 
-|                       | load1m < 1.2  | 1.2 <= load1m < 3.0 | 3.0 <= load1m < 8 | load1m >= 8 |
-|---                    |---            |---                  |---                |---          |
-| **AC**                | L2            | L2 or L3 (hold)     | L3                | L4          |
-| **Battery >= 60%**    | L2            | L2 or L3 (hold)     | L3                | L3          |
-| **Battery 30-60%**    | L2            | L2                  | L2                | L2          |
-| **Battery < 30%**     | L1            | L1                  | L2                | L2          |
+|                       | load < 1.2  | 1.2 - 3.0       | 3.0 - 8 | load1m >= 8 |
+|---                    |---          |---              |---      |---          |
+| **AC**                | L2          | L2 or L3 (hold) | L3      | L4          |
+| **Battery >= 60%**    | L2          | L2              | L2      | L3          |
+| **Battery 30-60%**    | L2          | L2              | L2      | L2          |
+| **Battery < 30%**     | L1          | L1 / L2*        | L2      | L2          |
 
 - L1 fires on **user-absent signals**, not load alone: lid closed with no
   external displays, OR backlight = 0. Exception: Battery < 30% falls to L1
-  on load1m < 2 regardless of presence.
-- L2/L3 boundary uses **hysteresis** (1.2 / 3.0). Once at L3, load1m must
-  drop below 1.2 to step down; from L2, it must exceed 3.0 to step up. The
-  band in between holds whichever tier is current. Widened from 1.5/2.5 on
-  2026-07-01 after 6 weeks of data showed 47.9% chatter (the old band sat
-  inside the load1m noise mass).
+  on load1m < 2 regardless of presence (the `*` cell splits at load1m 2.0).
+- On **AC**, the L2/L3 boundary reads **load5m** (not load1m) with
+  **hysteresis** (1.2 / 3.0): once at L3, load5m must drop below 1.2 to step
+  down; from L2, it must exceed 3.0 to step up; the band holds the current
+  tier. Band widened from 1.5/2.5 on 2026-07-01, then the metric moved
+  load1m -> load5m on 2026-07-02 (6 weeks of data showed the boundary sat in
+  the load1m noise mass; load5m halved transition thrash at equal residency).
+  On **battery** the tier caps at L2 for load < 8 (only load1m >= 8 and
+  capacity >= 60% reaches L3), so there is no L2/L3 band there.
+- L4 (AC) and the battery >= 8 promotion read **load1m**: they fire on genuine
+  bursts, where reacting fast matters and chatter is already negligible.
 - Upgrades require 30s of sustained over-threshold load (6 ticks).
-- Downgrades require 20s of sustained low load (load1m AND load5m).
+- Downgrades require 20s of sustained low load, guarded by load5m < 8.
 - AC plug events cause re-evaluation on the next tick.
 - Power cost of the daemon itself: ~0.001W (negligible).
 

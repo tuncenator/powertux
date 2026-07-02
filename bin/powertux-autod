@@ -104,13 +104,14 @@ import time
 from pathlib import Path
 
 POLL_SEC = 5
-# 4-tick downgrade / 6-tick upgrade hold. Hysteresis on the L2/L3 boundary
-# (L2_TO_L3 / L3_TO_L2) does most of the chatter filtering; the hold catches
-# the remainder (single-tick spikes above 3.0, brief dips below 1.2).
-# Band widened 1.5/2.5 -> 1.2/3.0 and up-hold 20 -> 30 on 2026-07-01: 6 weeks
-# of data showed the 1.5/2.5 band still sat inside the load1m noise mass (30.6%
-# of ticks in [1.5, 2.5]) and chatter regressed to 47.9%. Backtest on the real
-# auto dataset: 1.2/3.0 -> ~23% sim chatter, ~45% fewer transitions/hr.
+# 4-tick downgrade / 6-tick upgrade hold. The L2/L3 boundary decision runs on
+# load5m (see compute_target); the band (L2_TO_L3 / L3_TO_L2) plus the hold do
+# the chatter filtering. Band widened 1.5/2.5 -> 1.2/3.0 and up-hold 20 -> 30 on
+# 2026-07-01 (6 weeks of data: 1.5/2.5 band sat inside the load1m noise mass,
+# chatter 47.9%). Boundary metric moved load1m -> load5m on 2026-07-02: whatif
+# backtest cut transitions 0.86 -> 0.56/hr and reversals/hr 0.21 -> 0.15 at flat
+# residency. Holds kept at 30/20 (an up-hold sweep on load5m regressed both
+# metrics below 30s).
 DOWNGRADE_HOLD_SEC = 20
 UPGRADE_HOLD_SEC = 30
 L2_TO_L3 = 3.0
@@ -519,10 +520,19 @@ def compute_target(load1m, load5m, load15m, ac, capacity, current,
                    lid, brightness_pct, displays_ext):
     """Return level 1-4 from inputs.
 
-    L2/L3 hysteresis: up at load1m >= 3.0, down at < 1.2. The symmetric 2.0
+    L2/L3 hysteresis: up at load5m >= 3.0, down at < 1.2. The symmetric 2.0
     threshold, then the 1.5/2.5 band, both sat inside the load1m noise mass
     (30.6% of ticks in [1.5, 2.5]); 6 weeks of data still showed 47.9% chatter,
-    so the band was widened to 1.2/3.0 on 2026-07-01.
+    so the band was widened to 1.2/3.0 on 2026-07-01. That helped (post-tune
+    33%) but load1m's p50 (1.73) sits in the band and 52% of ticks fall inside
+    it, so the boundary still flapped. On 2026-07-02 the L2/L3 decision moved to
+    load5m (the same signal low-passed over 5 min): whatif backtest on the full
+    dataset dropped transitions 0.86 -> 0.56/hr and absolute reversals/hr 0.21
+    -> 0.15 at unchanged residency (L2 67 / L3 31). The up-hold still filters
+    load5m's slower drift across the boundary (trimming it regressed both), so
+    the 30/20s holds stay. L4 and the battery load>=8 branch keep load1m: they
+    fire on genuine bursts where fast reaction matters and chatter there is
+    already negligible (L3<->L4 = 3.9% of transitions).
 
     L1 fires on 'user not present' (lid closed with no externals, or panel
     backlight at 0). The old 'load1m AND load5m AND load15m all < 1' gate
@@ -538,7 +548,7 @@ def compute_target(load1m, load5m, load15m, ac, capacity, current,
     if ac:
         if load1m >= 8:
             return 4
-        if load1m >= l23_thr:
+        if load5m >= l23_thr:
             return 3
         return 2  # AC floor stays L2 (no L1 benefit on AC)
     # battery

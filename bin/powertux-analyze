@@ -654,8 +654,8 @@ def section_tldr(s):
                f"{s.pend_reverted} reverted "
                f"({fmt_pct(s.pend_reverted / tot)} suppressed transients)")
     bullet(0,
-           f"load1m sits in [1.2, 3.0] {fmt_pct(s.near_l2_l3 / s.span)} of "
-           f"the window -- the L2/L3 hysteresis band")
+           f"load1m sits in [1.2, 3.0] {fmt_pct(s.near_l2_l3 / (s.n * TICK))} "
+           f"of logged time -- the L2/L3 hysteresis band")
 
 
 def section_recommendations(s):
@@ -667,17 +667,20 @@ def section_recommendations(s):
     if s.transitions and s.chatter_pct > TARGET_CHATTER_PCT:
         recs.append((
             CRIT_COLOR if s.chatter_pct > 50 else WARN_COLOR,
-            "move the L2/L3 decision to load5m "
-            "(band 1.2/3.0 and up-hold already widened)",
+            "L2/L3 chatter above target -- tighten the band or lengthen the hold",
             [
-                f"reason: {s.chatter_pct:.1f}% of transitions still reverted "
-                f"within {CHATTER_WINDOW_SEC // 60}min at band 1.2/3.0, hold "
-                f"{UPGRADE_HOLD_SEC}/{DOWNGRADE_HOLD_SEC}s; load1m spends "
-                f"{fmt_pct(s.near_l2_l3 / s.span)} of the window in [1.2, 3.0].",
-                "effect: load5m is smoother across the boundary -- backtest cut "
-                "trans/hr to ~0.5 vs ~0.9 for band-widening alone.",
-                "trade-off: ~1-2 ticks slower to react to a genuinely sustained "
-                "ramp, since load5m lags load1m.",
+                f"reason: {s.chatter_pct:.1f}% of transitions reverted "
+                f"within {CHATTER_WINDOW_SEC // 60}min; load1m spends "
+                f"{fmt_pct(s.near_l2_l3 / (s.n * TICK))} of logged time in "
+                "[1.2, 3.0]. The L2/L3 decision already runs on load5m (moved "
+                "2026-07-02), which cut absolute reversals/hr but leaves a "
+                "residual since the boundary sits in the load mass.",
+                "note: chatter% is a ratio -- load5m lowered total transitions "
+                "faster than reversals, so the % can read flat/up while "
+                "absolute thrash (reversals/hr) drops. Check trans/hr too.",
+                "options: narrow the band toward 1.3/2.7, raise UPGRADE_HOLD_SEC "
+                "past 30s, or accept it (each L2<->L3 flip is one tccd switch, "
+                "~0.15/hr now). Backtest any change via the whatif section.",
             ],
         ))
 
@@ -736,8 +739,8 @@ def section_recommendations(s):
                     "reason: many transitions queued, hold ran, condition "
                     "cleared before the timer fired. Either the hold is too "
                     "long (over-smoothing) or the threshold is at a noise "
-                    f"band ({fmt_pct(s.near_l2_l3 / s.span)} time in the "
-                    "boundary).",
+                    f"band ({fmt_pct(s.near_l2_l3 / (s.n * TICK))} of logged "
+                    "time in the boundary).",
                     "effect: real load drops never get the lower tier they "
                     "deserve. Wasted W on AC, wasted battery on bat.",
                     "options: shorter DOWNGRADE_HOLD_SEC, or move the "
@@ -1463,6 +1466,10 @@ def _simulate(rows, params):
 
     def policy(r, cur):
         load1m = r.get("load1m") or 0
+        # L2/L3 decision runs on the configured metric (load1m or load5m);
+        # L4 and the battery load>=8 branch always stay on load1m (burst
+        # detectors). Mirrors compute_target in powertux-autod.
+        l23 = r.get(params.get("l23_metric", "load1m")) or 0
         ac = r.get("ac") == 1
         cap = r.get("cap") or 100
         lid = r.get("lid")
@@ -1474,7 +1481,7 @@ def _simulate(rows, params):
         if ac:
             if load1m >= params["l4"]:
                 return 4
-            if load1m >= thr_23:
+            if l23 >= thr_23:
                 return 3
             return 2
         if cap >= 60:
@@ -1547,14 +1554,17 @@ def section_whatif(s):
     """
     section("What-if (replay current data through alternate policy)")
     variants = [
-        ("current  (hyst 1.2/3.0, hold 30/20, L1=absent)",
-         {"l3_up": 3.0, "l3_dn": 1.2, "l4": 8.0,
+        ("current  (L2/L3 on load5m, 1.2/3.0, hold 30/20)",
+         {"l23_metric": "load5m", "l3_up": 3.0, "l3_dn": 1.2, "l4": 8.0,
           "up_hold": 30, "dn_hold": 20, "l1_absent": True}),
-        ("prev     (hyst 1.5/2.5, hold 20/20, L1=absent)",
-         {"l3_up": 2.5, "l3_dn": 1.5, "l4": 8.0,
+        ("prev     (L2/L3 on load1m, 1.2/3.0, hold 30/20)",
+         {"l23_metric": "load1m", "l3_up": 3.0, "l3_dn": 1.2, "l4": 8.0,
+          "up_hold": 30, "dn_hold": 20, "l1_absent": True}),
+        ("band15   (L2/L3 on load1m, 1.5/2.5, hold 20/20)",
+         {"l23_metric": "load1m", "l3_up": 2.5, "l3_dn": 1.5, "l4": 8.0,
           "up_hold": 20, "dn_hold": 20, "l1_absent": True}),
-        ("old      (thr 2.0,       hold  5/30, L1=load)",
-         {"l3_up": 2.0, "l3_dn": 2.0, "l4": 8.0,
+        ("old      (thr 2.0 load1m, hold  5/30, L1=load)",
+         {"l23_metric": "load1m", "l3_up": 2.0, "l3_dn": 2.0, "l4": 8.0,
           "up_hold": 5,  "dn_hold": 30, "l1_absent": False}),
     ]
     auto_rows = [r for r in s.rows if r.get("mode") == "auto"]
