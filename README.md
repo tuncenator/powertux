@@ -18,6 +18,11 @@ range, and switches between them based on what you're actually doing.
   `perf` (~64W). Numbers come from per-chassis calibration, not vendor guesswork.
 - **Adaptive daemon** (`powertux-autod`) that picks a tier from AC plug,
   battery %, and 1-min load. Hysteresis on downgrades to avoid chatter.
+- **Low-battery alerts**: desktop notifications (via `notify-send`) at three
+  escalating rungs when battery % or the discharge ETA crosses a threshold
+  (warn 20%/30m, crit 10%/15m, emerg 5%). The emergency rung also pins the
+  silent tier (L1) to stretch runtime; unpin to hand control back to auto.
+  Edge-triggered (one popup per rung per discharge session).
 - **Waybar widget** with per-segment colored Pango markup. Click to pin /
   raise / lower the tier. Suffix `a` marks auto mode.
 - **CLI** (`powertux-mode`) for keybind-driven toggles, no GUI needed.

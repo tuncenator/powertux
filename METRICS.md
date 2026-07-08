@@ -230,6 +230,7 @@ time-to-end and tune the algorithm from data.
 |---|---|---|---|---|
 | `eta_empty_s` | computed | seconds | predicted time until discharge ends, only set when `status == "Discharging"`. Rolling-mean `w_sys` over the last 900 s divided into OCV-derived remaining Wh (mAh from `raw_xif2_mah`, voltage from `v_bat`). Null if fewer than 6 discharge samples in the window, or inputs missing. | OK for the algorithm as written; calibration via `powertux-eta-bench` |
 | `eta_full_s` | computed | seconds | predicted time until charge ends, only set when `status == "Charging"`. `(charge_full - charge_now) / current_now`. | partial: `current_now` is suppressed during the trickle tail on this board, so the late-charge prediction blows up. CC-stage prediction is reasonable. |
+| `alert_level` | computed | 0..3 | low-battery notification rung at this tick: 0 none / 1 warn / 2 crit / 3 emerg. Max of a percent rung (`ALERT_PCT_*`) and a time rung (`ALERT_ETA_*` on `eta_empty_s`); 0 unless `status == "Discharging"`. Edge-triggered notify + emerg L1 pin are driven off this. | OK |
 
 ---
 

@@ -186,6 +186,27 @@ OCV_SOC = [
     (3.60, 20), (3.55, 15), (3.50, 10), (3.45, 5),
     (3.40, 0),
 ]
+# Low-battery desktop alerts (notify-send -> swaync). Fire on the max severity
+# of a percent rung and a time-to-empty rung, edge-triggered (once per rung per
+# discharge session), only while status == "Discharging". Emerg additionally
+# pins L1 (silent) to stretch runtime; the user unpins to hand control back to
+# auto. eta_empty_s is the daemon's own EWMA-smoothed discharge ETA, so the
+# time rungs inherit its ~3min smoothing (no extra debounce needed).
+ALERT_PCT_WARN   = 20      # rung 1
+ALERT_PCT_CRIT   = 10      # rung 2
+ALERT_PCT_EMERG  = 5       # rung 3
+ALERT_ETA_WARN_S = 1800    # 30 min -> rung 1
+ALERT_ETA_CRIT_S = 900     # 15 min -> rung 2 (no eta rung for emerg; % only)
+ALERT_REARM_PCT  = 23      # re-arm the latch once cap climbs back above this
+ALERT_EMERG_PIN_LEVEL = 1  # tier to pin at emerg (L1 silent, ~19W)
+ALERT_APP_NAME   = "powertux"
+ALERT_TAG        = "powertux-battery"  # x-canonical-private-synchronous replace tag
+# Escalating alert sound per rung, played directly via canberra-gtk-play from
+# the freedesktop sound theme (swaync has no per-notification sound). Event ids
+# resolve to /usr/share/sounds/freedesktop/stereo/<id>.oga. Set _ENABLED False
+# to silence, or remap to other theme events (bell / alarm-clock-elapsed / ...).
+ALERT_SOUND_ENABLED = True
+ALERT_SOUNDS = {1: "dialog-warning", 2: "dialog-error", 3: "suspend-error"}
 STATE_FILE = Path.home() / ".config" / "powertux" / "state.json"
 LOG_DIR = Path.home() / "Programs" / "powertux" / "log"
 LOAD_FILE = "/proc/loadavg"
@@ -571,6 +592,115 @@ def compute_target(load1m, load5m, load15m, ac, capacity, current,
 def apply_level(level):
     subprocess.run(SET_CMD + [str(level)], check=False, timeout=10)
     subprocess.run(["pkill", "-SIGRTMIN+1", "waybar"], check=False)
+
+
+def alert_level(cap, eta_empty_s, status):
+    """Low-battery severity 0..3 (0=none/1=warn/2=crit/3=emerg).
+
+    Pure. Only alerts while discharging. Severity is the max of a percent rung
+    and a time-to-empty rung; the time rung is skipped when eta_empty_s is None
+    (discharge warmup / post-suspend, when the daemon emits no ETA)."""
+    if status != "Discharging" or cap is None:
+        return 0
+    lvl = 0
+    if cap <= ALERT_PCT_EMERG:
+        lvl = 3
+    elif cap <= ALERT_PCT_CRIT:
+        lvl = 2
+    elif cap <= ALERT_PCT_WARN:
+        lvl = 1
+    if eta_empty_s is not None:
+        if eta_empty_s <= ALERT_ETA_CRIT_S:
+            lvl = max(lvl, 2)
+        elif eta_empty_s <= ALERT_ETA_WARN_S:
+            lvl = max(lvl, 1)
+    return lvl
+
+
+def alert_rearm(level, cap, status):
+    """True when the alert latch should reset (re-arm for a fresh session).
+
+    Pure. Re-arms when off-battery, or while discharging once nothing is
+    tripping (level 0) AND cap has climbed a margin above the warn rung. The
+    level==0 guard matters: the eta dimension can trip above ALERT_REARM_PCT
+    (e.g. 24% under heavy load), and a cap-only re-arm would reset the latch
+    every tick and re-fire the warn each poll."""
+    if status != "Discharging":
+        return True
+    return level == 0 and cap is not None and cap > ALERT_REARM_PCT
+
+
+def _notify_env():
+    """os.environ copy with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+    ensured, so notify-send reaches the session bus and canberra reaches the
+    PipeWire/Pulse socket from the systemd --user service."""
+    env = dict(os.environ)
+    runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = runtime
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime}/bus"
+    return env
+
+
+def play_alert_sound(level):
+    """Play the escalating alert sound for a rung. Best-effort, swallowed."""
+    event = ALERT_SOUNDS.get(level)
+    if not ALERT_SOUND_ENABLED or not event:
+        return
+    try:
+        subprocess.run(["canberra-gtk-play", "-i", event],
+                       check=False, timeout=5, env=_notify_env())
+    except Exception as e:
+        log(f"alert sound failed: {e}")
+
+
+def send_battery_alert(level, cap, eta_empty_s):
+    """Fire a notify-send popup for the given rung. Best-effort: any failure is
+    logged and swallowed so the poll loop is never disturbed."""
+    titles = {1: "Battery low", 2: "Battery critical", 3: "Battery emergency"}
+    urgency = "critical" if level >= 3 else "normal"
+    icon = "battery-empty-symbolic" if level >= 3 else "battery-caution-symbolic"
+    cap_str = f"{cap}%" if cap is not None else "?%"
+    if eta_empty_s is not None:
+        mins = max(0, round(eta_empty_s / 60))
+        body = f"{cap_str} - about {mins} min left"
+    else:
+        body = f"{cap_str} remaining"
+    cmd = [
+        "notify-send",
+        "-a", ALERT_APP_NAME,
+        "-u", urgency,
+        "-i", icon,
+        "-c", "device",
+        "-h", f"string:x-canonical-private-synchronous:{ALERT_TAG}",
+    ]
+    if level >= 2:
+        cmd += ["-t", "0"]  # crit/emerg stay until dismissed
+    cmd += [titles.get(level, "Battery"), body]
+    try:
+        subprocess.run(cmd, check=False, timeout=5, env=_notify_env())
+    except Exception as e:
+        log(f"alert notify failed: {e}")
+    play_alert_sound(level)
+
+
+def pin_emergency_level():
+    """Emergency action: apply L1 then persist a pinned state, mirroring
+    `powertux-mode pinned 1` (apply, then write state.json). Returns the pinned
+    level so the caller can sync last_applied and keep the pinned-mode handler
+    from phantom-reapplying next tick."""
+    lvl = ALERT_EMERG_PIN_LEVEL
+    apply_level(lvl)
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"mode": "pinned", "level": lvl}) + "\n")
+        os.replace(tmp, STATE_FILE)
+        subprocess.run(["pkill", "-SIGRTMIN+1", "waybar"], check=False)
+        log(f"emerg pin -> L{lvl} (battery critical)")
+    except OSError as e:
+        log(f"emerg pin state write failed: {e}")
+    return lvl
 
 
 def read_tccd_active_id():
@@ -1061,6 +1191,8 @@ def main():
     eta_empty_ewma = None   # EWMA state for the emitted discharge ETA
     eta_empty_prev_t = None  # last tick time, to reset EWMA across gaps
     w_rate_buf = []          # trailing (t, w_sys) for the v3 discharge-rate median
+    last_alert_level = 0     # highest low-battery rung notified this session
+    emerg_pinned = False     # emerg pin fired once per discharge session
 
     while True:
         try:
@@ -1173,6 +1305,8 @@ def main():
             eta_full_s = compute_eta_full_s(bat, cap)
             upower = read_upower()
 
+            cur_alert_level = alert_level(cap, eta_empty_s, bat["status"])
+
             log_tick({
                 "t": now.isoformat(timespec="seconds"),
                 "mode": mode,
@@ -1216,10 +1350,25 @@ def main():
                 "fan2_temp_c": fan2_temp_c,
                 "eta_empty_s": round(eta_empty_s) if eta_empty_s is not None else None,
                 "eta_full_s": round(eta_full_s) if eta_full_s is not None else None,
+                "alert_level": cur_alert_level,
                 "upower_w": round(upower["w"], 2) if upower["w"] is not None else None,
                 "upower_eta_empty_s": upower["eta_empty_s"],
                 "upower_eta_full_s": upower["eta_full_s"],
             })
+
+            # Low-battery alerts. Re-arm the latch first (off-battery, or
+            # recovered above the margin with nothing tripping), then notify
+            # only on escalation, then run the emerg pin once per session.
+            if alert_rearm(cur_alert_level, cap, bat["status"]):
+                last_alert_level = 0
+                emerg_pinned = False
+            if cur_alert_level > last_alert_level:
+                send_battery_alert(cur_alert_level, cap, eta_empty_s)
+                last_alert_level = cur_alert_level
+            if cur_alert_level >= 3 and not emerg_pinned:
+                last_applied = pin_emergency_level()
+                pending_target = None
+                emerg_pinned = True
 
             if mode != "auto":
                 # Cold start: re-apply pinned level so we recover from tccd
