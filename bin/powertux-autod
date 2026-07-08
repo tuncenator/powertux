@@ -201,6 +201,12 @@ ALERT_REARM_PCT  = 23      # re-arm the latch once cap climbs back above this
 ALERT_EMERG_PIN_LEVEL = 1  # tier to pin at emerg (L1 silent, ~19W)
 ALERT_APP_NAME   = "powertux"
 ALERT_TAG        = "powertux-battery"  # x-canonical-private-synchronous replace tag
+# Escalating alert sound per rung, played directly via canberra-gtk-play from
+# the freedesktop sound theme (swaync has no per-notification sound). Event ids
+# resolve to /usr/share/sounds/freedesktop/stereo/<id>.oga. Set _ENABLED False
+# to silence, or remap to other theme events (bell / alarm-clock-elapsed / ...).
+ALERT_SOUND_ENABLED = True
+ALERT_SOUNDS = {1: "dialog-warning", 2: "dialog-error", 3: "suspend-error"}
 STATE_FILE = Path.home() / ".config" / "powertux" / "state.json"
 LOG_DIR = Path.home() / "Programs" / "powertux" / "log"
 LOAD_FILE = "/proc/loadavg"
@@ -625,13 +631,27 @@ def alert_rearm(level, cap, status):
 
 
 def _notify_env():
-    """os.environ copy with DBUS_SESSION_BUS_ADDRESS ensured, so notify-send
-    can reach the session bus from the systemd --user service."""
+    """os.environ copy with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+    ensured, so notify-send reaches the session bus and canberra reaches the
+    PipeWire/Pulse socket from the systemd --user service."""
     env = dict(os.environ)
+    runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = runtime
     if not env.get("DBUS_SESSION_BUS_ADDRESS"):
-        runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime}/bus"
     return env
+
+
+def play_alert_sound(level):
+    """Play the escalating alert sound for a rung. Best-effort, swallowed."""
+    event = ALERT_SOUNDS.get(level)
+    if not ALERT_SOUND_ENABLED or not event:
+        return
+    try:
+        subprocess.run(["canberra-gtk-play", "-i", event],
+                       check=False, timeout=5, env=_notify_env())
+    except Exception as e:
+        log(f"alert sound failed: {e}")
 
 
 def send_battery_alert(level, cap, eta_empty_s):
@@ -661,6 +681,7 @@ def send_battery_alert(level, cap, eta_empty_s):
         subprocess.run(cmd, check=False, timeout=5, env=_notify_env())
     except Exception as e:
         log(f"alert notify failed: {e}")
+    play_alert_sound(level)
 
 
 def pin_emergency_level():
